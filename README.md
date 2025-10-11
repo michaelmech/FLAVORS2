@@ -39,21 +39,6 @@ print(f"Selected feature indices: {selector.selected_indices_}")
 
 This performs a budgeted search for the optimal subset using default metrics (AUC for classification or R² for regression).
 
-<p align="center">
-  <img src="assets/score_advantage.png" alt="Score Advantage" width="544"/>
-</p>
-
-**Figure 1.** Distribution of FLAVORS² score advantage over baselines like GJO, RFE, and Permutation.
-
-To visualize the Pareto frontier of performance vs. runtime across datasets:
-
-<p align="center">
-  <img src="assets/pareto_frontier.png" alt="Pareto Frontier" width="616"/>
-</p>
-
-**Figure 2.** Pareto frontier showing trade-off between performance and runtime across datasets.
-
-
 ## Advanced Usage
 
 ### Custom Metrics
@@ -183,14 +168,30 @@ selector = FLAVORS2FeatureSelector(
 FLAVORS2 outperforms baselines in rankings and wins:
 
 <p align="center">
-  <img width="544" src="assets/ranking_distribution.png" />
+  <img width="544" src="assets/boxplot_graph.png" />
 </p>
 
 <p align="center">
-  <img width="544" src="assets/share_won.png" />
+  <img width="544" src="assets/pie_graph.png" />
 </p>
 
+<p align="center">
+  <img src="assets/distribution_graph.png" alt="Score Advantage" width="544"/>
+</p>
+
+**Figure 1.** Distribution of FLAVORS² score advantage over baselines like GJO, RFE, and Permutation.
+
+To visualize the Pareto frontier of performance vs. runtime across datasets:
+
+<p align="center">
+  <img src="assets/pareto_graph.png" alt="Pareto Frontier" width="616"/>
+</p>
+
+**Figure 2.** Pareto frontier showing trade-off between performance and runtime across datasets.
+
+
 See `assets/h2h_benchmark_summary.csv` for details.
+
 
 ## Documentation
 
