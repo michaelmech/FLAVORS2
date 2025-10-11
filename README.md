@@ -1,5 +1,5 @@
 FLAVORS² — Adaptive Feature Selection with Pareto Search
-Fast and Lightweight Assessment of Variables for Optimally-reduced subsets, Resource-aware and Searchable towards Feature Learning Automation with Variable-objective, Resource scheduling.
+Fast and Lightweight Assessment of Variables for Optimally-reduced subsets, Resource-aware and Searchable towards Feature Learning Automation with Variable-Objective, Resource Scheduling.
 
 FLAVORS² is a flexible, metaheuristic framework for selecting informative subsets of features in supervised learning tasks. It supports single and multi-objective optimization, incorporates custom metrics, handles time budgets, accepts warm priors, and can exploit model-estimated feature importances during search.
 
@@ -8,9 +8,11 @@ Install the latest release from PyPI. Note that the package name on PyPI (flavor
 
 pip install flavors-squared
 
+
 Then import the selector from the flavors2 namespace:
 
 from flavors2 import FLAVORS2FeatureSelector
+
 
 🚀 Quick Start (Single Metric)
 Below, we select features for a binary classification task using a custom ROC AUC metric.
@@ -61,6 +63,7 @@ X_sel = selector.transform(X)
 
 print("Selected indices:", selector.get_support(indices=True).tolist())
 
+
 The call to fit will search for a subset of features that maximizes your metric within the time budget. If your metric returns a model, FLAVORS² leverages its feature importances to update the search more intelligently.
 
 🎯 Multi-metric (Pareto) Example
@@ -105,6 +108,7 @@ selector_pareto = FLAVORS2FeatureSelector(
 selector_pareto.fit(X, y)
 X_sel_pareto = selector_pareto.transform(X)
 
+
 After fitting, you can examine the Pareto frontier via selector_pareto.selector.pareto_history. Each point in the frontier is a non-dominated solution across all metrics.
 
 ⏱️ Time Budgeting
@@ -113,6 +117,7 @@ The budget argument (in seconds) caps the length of the search. FLAVORS² return
 # Tight 10-second budget for quick experiments
 fast_selector = FLAVORS2FeatureSelector(budget=10, metrics=[auc_metric])
 fast_selector.fit(X, y)
+
 
 You can compute a time budget by measuring alternative selectors and passing the minimum duration into FLAVORS² for a fair benchmark.
 
@@ -134,6 +139,7 @@ selector_with_priors = FLAVORS2FeatureSelector(
 
 selector_with_priors.fit(X, y)
 
+
 To warm-start across datasets, persist selector.selector.feature_performance from a previous run and feed it back as feature_priors.
 
 ⚖️ Importance-Weighted Updates
@@ -149,6 +155,7 @@ selector_imp = FLAVORS2FeatureSelector(
 )
 
 selector_imp.fit(X, y)
+
 
 🔗 Pipeline Integration
 FLAVORS² is compatible with scikit-learn pipelines and column selectors. If you work with pandas DataFrames, the get_feature_names_out() method will return the selected feature names in order.
@@ -172,17 +179,15 @@ pipe.fit(df, y)
 mask = pipe.named_steps["select"].get_support()
 print("Selected mask:", mask.tolist())
 
+
 💡 FAQ
 Q: How do I pass sample weights?
-
 A: Call selector.fit(X, y, sample_weight=w)—FLAVORS² will forward them into your metric if it accepts sample_weight.
 
 Q: Do I need to make all objectives “maximize”?
-
 A: Yes—return larger-is-better scores. If you conceptually want to minimize something, simply negate it before returning.
 
 Q: What if I only return a single number?
-
 A: Returning a plain float is fine; FLAVORS² will wrap it as {"score": float} internally. Returning {"score": float, "model": est} unlocks importance-weighted updates.
 
 📄 License
