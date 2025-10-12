@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flavors-squared"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast and Lightweight Assessment of Variables for Optimally-Reduced Subsets towards Feature Learning Automation with Variable-Objective, Resource Scheduling"
 readme = "README.md"
 license = { file = "LICENSE" }
