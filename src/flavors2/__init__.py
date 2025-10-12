@@ -14,4 +14,4 @@ Examples
 from .core import FLAVORS2  # noqa: F401
 from .__version__ import __version__  # noqa: F401
 
-__all__ = ["FLAVORS2", "__version__"]
+__all__ = ["FLAVORS2", "__version__",'FLAVORS2FeatureSelector']
