@@ -11,7 +11,15 @@ Examples
 >>> fs.fit(X, y)
 """
 
-from .core import FLAVORS2,FLAVORS2FeatureSelector  
+from .core import FLAVORS2,FLAVORS2FeatureSelector
+from .legacy import FLAVORS2 as FLAVORS2Legacy
+from .legacy import FLAVORS2FeatureSelector as FLAVORS2LegacyFeatureSelector
 from .__version__ import __version__  
 
-__all__ = ["FLAVORS2", "__version__",'FLAVORS2FeatureSelector']
+__all__ = [
+    "FLAVORS2",
+    "FLAVORS2FeatureSelector",
+    "FLAVORS2Legacy",
+    "FLAVORS2LegacyFeatureSelector",
+    "__version__",
+]

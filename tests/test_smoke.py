@@ -17,3 +17,6 @@ def test_version_and_api():
 
     assert hasattr(flavors2, "__version__")
     assert hasattr(flavors2, "FLAVORS2")
+    assert hasattr(flavors2, "FLAVORS2FeatureSelector")
+    assert hasattr(flavors2, "FLAVORS2Legacy")
+    assert hasattr(flavors2, "FLAVORS2LegacyFeatureSelector")

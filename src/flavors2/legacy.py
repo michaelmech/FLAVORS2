@@ -124,10 +124,6 @@ class FLAVORS2:
         self.n_jobs = n_jobs
         self.boruta = boruta
         self._rng = np.random.RandomState(random_state)
-        self._score_cache = {}
-        self.cache_hits_ = 0
-        self.cache_misses_ = 0
-        self.candidate_pool_size = max(8, 4 * max(1, n_jobs))
 
         if metrics is None:
             # Use a static method reference directly
@@ -584,52 +580,6 @@ class FLAVORS2:
             'subset_key': tuple(subset)
         }
 
-    @staticmethod
-    def _normalize_subset_key(subset):
-        return tuple(sorted(set(map(int, subset))))
-
-    def _cached_result(self, key):
-        cached = self._score_cache.get(key)
-        if cached is None:
-            return None
-        self.cache_hits_ += 1
-        result = dict(cached)
-        result["eval_time"] = 0.0
-        result["cache_hit"] = True
-        return result
-
-    def _evaluate_batch(self, subsets):
-        keys = [self._normalize_subset_key(subset) for subset in subsets]
-        results_by_key = {}
-        missing_keys = []
-
-        for key in keys:
-            cached = self._cached_result(key)
-            if cached is not None:
-                results_by_key[key] = cached
-            elif key not in results_by_key and key not in missing_keys:
-                missing_keys.append(key)
-
-        if missing_keys:
-            self.cache_misses_ += len(missing_keys)
-            if self.n_jobs > 1 and len(missing_keys) > 1:
-                parallel = Parallel(n_jobs=self.n_jobs)
-                computed = parallel(delayed(self._compute_subset_score)(
-                    list(key), self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
-                ) for key in missing_keys)
-            else:
-                computed = [self._compute_subset_score(
-                    list(key), self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
-                ) for key in missing_keys]
-
-            for key, result in zip(missing_keys, computed):
-                result = dict(result)
-                result["cache_hit"] = False
-                self._score_cache[key] = result
-                results_by_key[key] = result
-
-        return [dict(results_by_key[key]) for key in keys]
-
 
 
     @staticmethod
@@ -926,7 +876,7 @@ class FLAVORS2:
         if self.unevaluated:                       # coverage mode
             k_unseen   = int(np.ceil(0.20 * n_target_feats))           # 20 % of the subset
             k_unseen   = min(k_unseen, len(self.unevaluated))
-            must_pick  = self._rng.choice(list(self.unevaluated), size=k_unseen, replace=False).tolist() if k_unseen > 0 else []
+            must_pick  = random.sample(list(self.unevaluated), k_unseen)
             remaining  = n_target_feats - k_unseen
 
 
@@ -936,10 +886,9 @@ class FLAVORS2:
               # 1️⃣ slice
               probs_pool = probabilities[pool]
               # 2️⃣ renormalise
-              probs_sum = probs_pool.sum()
-              probs_pool = probs_pool / probs_sum if probs_sum > 0 else np.ones(len(pool)) / len(pool)
+              probs_pool = probs_pool / probs_pool.sum()
 
-              others = self._rng.choice(pool,
+              others = np.random.choice(pool,
                                         size=remaining,
                                         replace=False,
                                         p=probs_pool)
@@ -948,116 +897,12 @@ class FLAVORS2:
               selected_feats = np.array(must_pick, dtype=int)
 
         else:                                      # normal mode
-            selected_feats = self._rng.choice(self.n_feats,
+            selected_feats = np.random.choice(self.n_feats,
                                               size=n_target_feats,
                                               replace=False,
                                               p=probabilities)
 
         return sorted(selected_feats.tolist())
-
-    def _random_weighted_subset(self, n_target_feats):
-        return self.search_strategy(n_target_feats)
-
-    def _mutate_subset(self, base_subset, n_target_feats, step_size):
-        base = set(map(int, base_subset))
-        n_target_feats = max(1, min(int(n_target_feats), self.n_feats))
-        step_size = max(1, int(step_size))
-
-        perf = self.feature_performance if hasattr(self, "feature_performance") else np.zeros(self.n_feats)
-        priors = self.feature_priors if hasattr(self, "feature_priors") else np.ones(self.n_feats) / self.n_feats
-        desirability = 0.65 * np.asarray(perf, dtype=float) + 0.35 * np.asarray(priors, dtype=float)
-        desirability = np.nan_to_num(desirability, nan=0.0, posinf=0.0, neginf=0.0)
-
-        current = set(base)
-        if len(current) > n_target_feats:
-            removable = list(current)
-            removable.sort(key=lambda f: desirability[f])
-            for feat in removable[:len(current) - n_target_feats]:
-                current.discard(feat)
-        elif len(current) < n_target_feats:
-            candidates = [f for f in range(self.n_feats) if f not in current]
-            candidates.sort(key=lambda f: desirability[f], reverse=True)
-            top_k = max(n_target_feats, min(len(candidates), 3 * max(1, n_target_feats - len(current))))
-            pool = candidates[:top_k]
-            needed = min(len(pool), n_target_feats - len(current))
-            if needed > 0:
-                current.update(self._rng.choice(pool, size=needed, replace=False).tolist())
-
-        action = self._rng.choice(["add", "remove", "swap"])
-        if action == "add" and len(current) < self.n_feats:
-            candidates = [f for f in range(self.n_feats) if f not in current]
-            candidates.sort(key=lambda f: desirability[f], reverse=True)
-            pool = candidates[:max(1, min(len(candidates), step_size * 4))]
-            current.add(int(self._rng.choice(pool)))
-        elif action == "remove" and len(current) > 1:
-            removable = list(current)
-            removable.sort(key=lambda f: desirability[f])
-            pool = removable[:max(1, min(len(removable), step_size * 4))]
-            current.discard(int(self._rng.choice(pool)))
-        elif action == "swap" and current and len(current) < self.n_feats:
-            removable = list(current)
-            removable.sort(key=lambda f: desirability[f])
-            addable = [f for f in range(self.n_feats) if f not in current]
-            addable.sort(key=lambda f: desirability[f], reverse=True)
-            remove_pool = removable[:max(1, min(len(removable), step_size * 4))]
-            add_pool = addable[:max(1, min(len(addable), step_size * 4))]
-            current.discard(int(self._rng.choice(remove_pool)))
-            current.add(int(self._rng.choice(add_pool)))
-
-        return sorted(current)
-
-    def _candidate_score(self, subset):
-        subset = self._normalize_subset_key(subset)
-        if subset in self._score_cache:
-            return float("-inf")
-
-        perf = self.feature_performance if hasattr(self, "feature_performance") else np.zeros(self.n_feats)
-        priors = self.feature_priors if hasattr(self, "feature_priors") else np.ones(self.n_feats) / self.n_feats
-        values = 0.55 * np.asarray(perf, dtype=float) + 0.45 * np.asarray(priors, dtype=float)
-        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
-        if not subset:
-            return float("-inf")
-
-        avg_value = float(np.mean(values[list(subset)]))
-        size_penalty = 0.01 * len(subset) / max(1, self.n_feats)
-        return avg_value - size_penalty
-
-    def _generate_candidate_batch(self, current_subset, batch_size, step_size, remaining_budget_fraction):
-        pool_size = max(batch_size, self.candidate_pool_size)
-        candidates = []
-
-        leaderboard_subsets = [list(subset) for _, subset in self.leaderboard[:min(5, len(self.leaderboard))]]
-        bases = [list(current_subset)] + leaderboard_subsets
-
-        for _ in range(pool_size):
-            if bases and self._rng.rand() > max(0.15, remaining_budget_fraction * 0.25):
-                base = bases[int(self._rng.randint(0, len(bases)))]
-                target = max(1, min(self.n_feats, len(base) + int(self._rng.choice([-1, 0, 1]) * max(1, step_size))))
-                candidate = self._mutate_subset(base, target, step_size)
-            else:
-                target = max(1, min(self.n_feats, len(current_subset) + int(self._rng.choice([-2, -1, 1, 2]) * max(1, step_size))))
-                candidate = self._random_weighted_subset(target)
-            candidates.append(candidate)
-
-        unique = {}
-        for candidate in candidates:
-            key = self._normalize_subset_key(candidate)
-            if key not in unique:
-                unique[key] = list(key)
-
-        ranked = sorted(unique.values(), key=self._candidate_score, reverse=True)
-        if len(ranked) < batch_size:
-            attempts = 0
-            while len(ranked) < batch_size and attempts < pool_size * 2:
-                target = max(1, min(self.n_feats, len(current_subset) + int(self._rng.choice([-1, 0, 1]) * max(1, step_size))))
-                candidate = self._random_weighted_subset(target)
-                key = self._normalize_subset_key(candidate)
-                if key not in unique:
-                    unique[key] = list(key)
-                    ranked.append(list(key))
-                attempts += 1
-
-        return ranked[:batch_size]
 
 
     def select_best_feature_subset(self, budget):
@@ -1077,7 +922,7 @@ class FLAVORS2:
 
         # Generate and evaluate initial subset
         current_subset = self.search_strategy(self.num_features)
-        result = self._evaluate_batch([current_subset])[0]
+        result = self._compute_subset_score(current_subset, self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats)
         self._update_after_evaluation(result, current_subset, [])
 
         # Initialize best error if first run (using lower-is-better convention)
@@ -1095,11 +940,37 @@ class FLAVORS2:
                 if remaining_time <= 0: break # Exit if time is up
                 remaining_budget_fraction = max(0.0, remaining_time / max(1e-9, (main_search_end - start_time).total_seconds()))
 
-                step_size = self.adjust_step_size(self.num_features, remaining_budget_fraction)
-                batch_subsets = self._generate_candidate_batch(
-                    current_subset, batch_size, step_size, remaining_budget_fraction
-                )
-                batch_results = self._evaluate_batch(batch_subsets)
+                # Generate batch of candidates
+                batch_subsets = []
+                for _ in range(batch_size):
+                    step_size = self.adjust_step_size(self.num_features, remaining_budget_fraction)
+
+                    # Determine change in subset size (add/remove features)
+                    # More random exploration early or if stuck
+                    if self.iters < 10 or no_improvement_counter > 5:
+                        # Larger random steps initially or when stuck
+                        step_change = random.choice([-2, -1, 1, 2]) * step_size
+                    else:
+                        # Smaller steps, allow staying same size
+                        step_change = random.choice([-1, 0, 1]) * step_size
+
+                    # Calculate new target size, ensuring it's within bounds
+                    new_num_features = max(1, min(self.n_feats, self.num_features + int(np.round(step_change))))
+
+                    # Generate new candidate subset
+                    new_subset = self.search_strategy(new_num_features)
+                    batch_subsets.append(new_subset)
+
+                # Evaluate batch in parallel if n_jobs > 1
+                if self.n_jobs > 1:
+                    parallel = Parallel(n_jobs=self.n_jobs)
+                    batch_results = parallel(delayed(self._compute_subset_score)(
+                        sub, self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
+                    ) for sub in batch_subsets)
+                else:
+                    batch_results = [self._compute_subset_score(
+                        sub, self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
+                    ) for sub in batch_subsets]
 
                 # Process results sequentially
                 improved = False
@@ -1126,22 +997,22 @@ class FLAVORS2:
 
                 # Probabilistic restart if stuck for too long
                 restart_prob = min(0.1, no_improvement_counter / 50.0) # Low probability restart
-                if self._rng.rand() < restart_prob and self.iters > 20: # Avoid restarting too early
+                if random.random() < restart_prob and self.iters > 20: # Avoid restarting too early
                     print("Performing probabilistic restart...")
                     # Restart near a good known size or explore a different size randomly
                     if self.leaderboard:
                          # Choose size from top 5 leaderboard entries
                          good_sizes = [len(s) for _, s in self.leaderboard[:min(5, len(self.leaderboard))]]
-                         restart_features = int(self._rng.choice(good_sizes)) if good_sizes else self.num_features
+                         restart_features = random.choice(good_sizes) if good_sizes else self.num_features
                     else:
                          # Randomly perturb current size
                          restart_features = max(1, min(self.n_feats,
-                                                 int(self._rng.normal(self.num_features, self.n_feats / 5))))
+                                                  int(np.random.normal(self.num_features, self.n_feats / 5))))
 
                     # Generate and evaluate restart subset
                     current_subset = self.search_strategy(restart_features)
                     self.num_features = len(current_subset)
-                    result = self._evaluate_batch([current_subset])[0]
+                    result = self._compute_subset_score(current_subset, self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats)
                     self._update_after_evaluation(result, current_subset, current_subset)  # Previous is itself for restart
                     no_improvement_counter = 0
 
@@ -1169,28 +1040,28 @@ class FLAVORS2:
                  # Generate batch of refinement actions
                  batch_subsets_refine = []
                  for _ in range(batch_size):
-                     action = self._rng.choice(['add', 'remove', 'swap'])
+                     action = random.choice(['add', 'remove', 'swap'])
 
                      new_subset_refine = None
 
                      if action == 'add' and candidates_add and len(best_subset_refine) < self.n_feats:
                          # Add one of the top-k candidates
                          k = max(1, min(3, len(candidates_add)//3))
-                         feat_to_add = int(self._rng.choice(candidates_add[:k]))
+                         feat_to_add = random.choice(candidates_add[:k])
                          new_subset_refine = best_subset_refine + [feat_to_add]
 
                      elif action == 'remove' and len(best_subset_refine) > 1:
                          # Remove one of the worst-k candidates
                          k = max(1, min(3, len(candidates_remove)//3))
-                         feat_to_remove = int(self._rng.choice(candidates_remove[:k]))
+                         feat_to_remove = random.choice(candidates_remove[:k])
                          new_subset_refine = [f for f in best_subset_refine if f != feat_to_remove]
 
                      elif action == 'swap' and candidates_add and len(best_subset_refine) > 0:
                          # Swap one of the worst-k out with one of the best-k in
                          k_out = max(1, min(3, len(candidates_remove)//3))
-                         feat_to_remove = int(self._rng.choice(candidates_remove[:k_out]))
+                         feat_to_remove = random.choice(candidates_remove[:k_out])
                          k_in = max(1, min(3, len(candidates_add)//3))
-                         feat_to_add = int(self._rng.choice(candidates_add[:k_in]))
+                         feat_to_add = random.choice(candidates_add[:k_in])
                          temp_subset = [f for f in best_subset_refine if f != feat_to_remove]
                          new_subset_refine = temp_subset + [feat_to_add]
 
@@ -1199,7 +1070,16 @@ class FLAVORS2:
                      else:
                          batch_subsets_refine.append(best_subset_refine)  # Fallback
 
-                 batch_results = self._evaluate_batch(batch_subsets_refine)
+                 # Evaluate batch in parallel
+                 if self.n_jobs > 1:
+                     parallel = Parallel(n_jobs=self.n_jobs)
+                     batch_results = parallel(delayed(self._compute_subset_score)(
+                         sub, self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
+                     ) for sub in batch_subsets_refine)
+                 else:
+                     batch_results = [self._compute_subset_score(
+                         sub, self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
+                     ) for sub in batch_subsets_refine]
 
                  # Process results
                  for idx, result in enumerate(batch_results):
@@ -1276,9 +1156,6 @@ class FLAVORS2:
             self.feature_addition_times = {}
             self.feature_removal_times = {}
             self.dup_dct = defaultdict(int)
-            self._score_cache = {}
-            self.cache_hits_ = 0
-            self.cache_misses_ = 0
             # Reset performance/stability tracking
             self.feature_performance = np.zeros(self.n_feats)
             self.feature_counts = np.zeros(self.n_feats)
