@@ -127,6 +127,7 @@ class FLAVORS2:
         self._score_cache = {}
         self.cache_hits_ = 0
         self.cache_misses_ = 0
+        self.loop_results_ = 0
         self.candidate_pool_size = max(8, 4 * max(1, n_jobs))
 
         if metrics is None:
@@ -692,10 +693,14 @@ class FLAVORS2:
       self.current_error = result.get('current_error')
       self.error_marker  = result.get('error_marker')
       subset_key       = result.get('subset_key')
+      cache_hit        = bool(result.get('cache_hit', False))
+      self.loop_results_ = getattr(self, "loop_results_", 0) + 1
 
       # ---- Bookkeeping
       if subset_key is not None:
           self.dup_dct[subset_key] += 1
+      if cache_hit:
+          return
       self.performance_history.append(self.current_error)
       self.cost_history.append(eval_time)
 
@@ -1279,6 +1284,7 @@ class FLAVORS2:
             self._score_cache = {}
             self.cache_hits_ = 0
             self.cache_misses_ = 0
+            self.loop_results_ = 0
             # Reset performance/stability tracking
             self.feature_performance = np.zeros(self.n_feats)
             self.feature_counts = np.zeros(self.n_feats)

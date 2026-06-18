@@ -77,6 +77,8 @@ def run_once(selector_cls, X, y, budget, seed, n_jobs):
     cache_hits = None
     cache_misses = None
     n_evals = None
+    fresh_evals = None
+    loop_results = None
 
     if selector.selector is not None:
         if selector.selector.leaderboard:
@@ -84,6 +86,8 @@ def run_once(selector_cls, X, y, budget, seed, n_jobs):
         cache_hits = getattr(selector.selector, "cache_hits_", None)
         cache_misses = getattr(selector.selector, "cache_misses_", None)
         n_evals = len(getattr(selector.selector, "performance_history", []))
+        fresh_evals = cache_misses if cache_misses is not None else n_evals
+        loop_results = getattr(selector.selector, "loop_results_", n_evals)
 
     return {
         "score_marker": best_marker,
@@ -92,6 +96,8 @@ def run_once(selector_cls, X, y, budget, seed, n_jobs):
         "elapsed_sec": elapsed,
         "cache_hits": cache_hits,
         "cache_misses": cache_misses,
+        "fresh_evals": fresh_evals,
+        "loop_results": loop_results,
         "n_evals": n_evals,
     }
 
