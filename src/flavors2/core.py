@@ -589,6 +589,22 @@ class FLAVORS2:
     def _normalize_subset_key(subset):
         return tuple(sorted(set(map(int, subset))))
 
+    @staticmethod
+    def _format_global_score(score):
+        if score is None:
+            return "unavailable"
+        if isinstance(score, (int, float, np.number)):
+            score = float(score)
+            return f"{score:.6f}" if np.isfinite(score) else str(score)
+        return str(score)
+
+    def _current_best_global_score(self):
+        if not hasattr(self, "best_error") or not np.isfinite(self.best_error):
+            return None
+        if len(getattr(self, "metrics", [])) == 1:
+            return self.best_error if self.minimize else -self.best_error
+        return -self.best_error
+
     def _cached_result(self, key):
         cached = self._score_cache.get(key)
         if cached is None:
@@ -1132,7 +1148,8 @@ class FLAVORS2:
                 # Probabilistic restart if stuck for too long
                 restart_prob = min(0.1, no_improvement_counter / 50.0) # Low probability restart
                 if self._rng.rand() < restart_prob and self.iters > 20: # Avoid restarting too early
-                    print("Performing probabilistic restart...")
+                    best_global_score = self._format_global_score(self._current_best_global_score())
+                    print(f"Performing probabilistic restart... best_global_score={best_global_score}")
                     # Restart near a good known size or explore a different size randomly
                     if self.leaderboard:
                          # Choose size from top 5 leaderboard entries
