@@ -10,25 +10,62 @@ Original file is located at
 # Core Python
 import numpy as np
 import pandas as pd
-import random
 import datetime
+import os
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, wait
 from heapq import heappop, heappush
 from functools import wraps
 import inspect
 
 # Scikit-learn
 from sklearn.utils import check_array
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
-from sklearn.base import BaseEstimator, TransformerMixin, clone
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import RobustScaler
+from sklearn.base import BaseEstimator, TransformerMixin
 
 
 # Joblib
 from joblib import Parallel, delayed,parallel_backend
+from joblib.externals.loky import ProcessPoolExecutor
+
+
+_EVALUATION_CONTEXT = {}
+_FINITE_CHECK_PARAMETER = (
+    "ensure_all_finite"
+    if "ensure_all_finite" in inspect.signature(check_array).parameters
+    else "force_all_finite"
+)
+
+
+def _check_finite_array(array, **kwargs):
+    return check_array(array, **kwargs, **{_FINITE_CHECK_PARAMETER: True})
+
+
+def _initialize_evaluation_worker(X, y, sample_weight, metrics, minimize, n_feats):
+    global _EVALUATION_CONTEXT
+    _EVALUATION_CONTEXT = {
+        "X": X,
+        "y": y,
+        "sample_weight": sample_weight,
+        "metrics": metrics,
+        "minimize": minimize,
+        "n_feats": n_feats,
+    }
+    return True
+
+
+def _compute_subset_score_in_worker(subset):
+    context = _EVALUATION_CONTEXT
+    return FLAVORS2._compute_subset_score(
+        subset,
+        context["X"],
+        context["y"],
+        context["sample_weight"],
+        context["metrics"],
+        context["minimize"],
+        context["n_feats"],
+    )
 
 class RankOrderTree:
     def __init__(self):
@@ -107,7 +144,7 @@ def test_metric_protocol(custom_metric):
 
 class FLAVORS2:
     def __init__(self, budget, minimize=False, metrics=None, c_sub=4, feature_priors=None, iters=None,
-                 n_jobs=1,boruta=False,random_state=42):
+                 n_jobs=1,boruta=False,random_state=42, strict_budget=True):
 
         self.leaderboard = []
         self.budget = budget
@@ -123,12 +160,18 @@ class FLAVORS2:
         self.feature_priors = feature_priors
         self.n_jobs = n_jobs
         self.boruta = boruta
+        self.strict_budget = strict_budget
         self._rng = np.random.RandomState(random_state)
         self._score_cache = {}
         self.cache_hits_ = 0
         self.cache_misses_ = 0
         self.loop_results_ = 0
         self.candidate_pool_size = max(8, 4 * max(1, n_jobs))
+        self._size_eval_counts = defaultdict(int)
+        self._size_best_errors = {}
+        self._evaluation_executor = None
+        self.timed_out_evaluations_ = 0
+        self.budget_exhausted_ = False
 
         if metrics is None:
             # Use a static method reference directly
@@ -183,7 +226,6 @@ class FLAVORS2:
         # This calculates sum of areas/volumes relative to origin, which isn't standard hypervolume.
         # Consider using a dedicated library (e.g., pygmo) if precise HV is needed.
         hypervolume = 0.0
-        last_point = ref_point
         for i in range(n):
              # This part is conceptually incorrect for standard hypervolume.
              # It's summing individual point contributions without proper slicing.
@@ -249,10 +291,10 @@ class FLAVORS2:
     def validate_input_arrays(func):
         @wraps(func)
         def wrapper(X, y, sample_weight=None):
-            X = check_array(X, ensure_2d=True, force_all_finite=True)
-            y = check_array(y, ensure_2d=False, force_all_finite=True, ensure_min_samples=1)
+            X = _check_finite_array(X, ensure_2d=True)
+            y = _check_finite_array(y, ensure_2d=False, ensure_min_samples=1)
             if sample_weight is not None:
-                sample_weight = check_array(sample_weight, ensure_2d=False, force_all_finite=True)
+                sample_weight = _check_finite_array(sample_weight, ensure_2d=False)
                 if sample_weight.shape[0] != y.shape[0]:
                     raise ValueError("sample_weight must have shape (n_samples,).")
             return func(X, y, sample_weight=sample_weight)
@@ -410,9 +452,12 @@ class FLAVORS2:
         removed_features = prev_set - new_set
 
         # Initialize history tracking if first time
-        if not hasattr(self, 'feature_addition_times'): self.feature_addition_times = {}
-        if not hasattr(self, 'feature_removal_times'): self.feature_removal_times = {}
-        if not hasattr(self, 'feature_cost_history'): self.feature_cost_history = {}
+        if not hasattr(self, 'feature_addition_times'):
+            self.feature_addition_times = {}
+        if not hasattr(self, 'feature_removal_times'):
+            self.feature_removal_times = {}
+        if not hasattr(self, 'feature_cost_history'):
+            self.feature_cost_history = {}
 
         for feat in added_features:
             if feat not in self.feature_addition_times:
@@ -473,7 +518,8 @@ class FLAVORS2:
 
          # Error gain (or loss if minimizing and feature_error is higher)
          error_diff = feature_error - best_error # Assumes lower error is better
-         if self.minimize: error_diff = -error_diff # Adjust if minimizing
+         if self.minimize:
+             error_diff = -error_diff # Adjust if minimizing
 
          # Improvement part of ECI (higher is better)
          improvement_term = error_diff * tau / delta
@@ -605,6 +651,243 @@ class FLAVORS2:
             return self.best_error if self.minimize else -self.best_error
         return -self.best_error
 
+    def _coverage_ratio(self):
+        if not hasattr(self, "unevaluated") or not hasattr(self, "n_feats") or self.n_feats <= 0:
+            return 1.0
+        return 1.0 - (len(self.unevaluated) / max(1, self.n_feats))
+
+    def _coverage_target(self, budget):
+        if self.n_feats <= 20:
+            return 0.8
+        if budget < 2:
+            return 0.65
+        return 0.85
+
+    def _set_coverage_pressure(self, remaining_budget_fraction, force=False):
+        if not hasattr(self, "unevaluated") or not self.unevaluated:
+            self._coverage_subset_fraction = 0.0
+            self._coverage_candidate_probability = 0.0
+            return
+
+        remaining_budget_fraction = max(0.0, min(1.0, float(remaining_budget_fraction)))
+        unseen_fraction = len(self.unevaluated) / max(1, self.n_feats)
+        budget_pressure = max(0.25, remaining_budget_fraction)
+
+        subset_fraction = 0.2 + (0.5 * unseen_fraction * budget_pressure)
+        candidate_probability = 0.25 + (0.6 * unseen_fraction * budget_pressure)
+
+        if force:
+            subset_fraction = max(subset_fraction, 0.65)
+            candidate_probability = max(candidate_probability, 0.8)
+
+        self._coverage_subset_fraction = max(0.2, min(0.8, subset_fraction))
+        self._coverage_candidate_probability = max(0.0, min(0.9, candidate_probability))
+
+    def _size_exploration_grid(self):
+        if not hasattr(self, "n_feats") or self.n_feats <= 0:
+            return [1]
+
+        base_sizes = {
+            1,
+            int(np.sqrt(self.n_feats)),
+            min(10, self.n_feats),
+            int(np.ceil(0.15 * self.n_feats)),
+            int(np.ceil(0.30 * self.n_feats)),
+            int(np.ceil(0.50 * self.n_feats)),
+            int(np.ceil(0.70 * self.n_feats)),
+        }
+        return sorted(max(1, min(self.n_feats, size)) for size in base_sizes)
+
+    def _size_exploration_probability(self, remaining_budget_fraction):
+        if not hasattr(self, "n_feats") or self.n_feats < 12:
+            return 0.05
+
+        remaining_budget_fraction = max(0.0, min(1.0, float(remaining_budget_fraction)))
+        iters = getattr(self, "iters", 0)
+        iters_best = getattr(self, "iters_best", 0)
+        stale_steps = max(0, iters - iters_best)
+
+        early_bonus = 0.12 if iters < 20 else 0.0
+        stale_bonus = min(0.15, stale_steps / 120.0)
+        coverage_bonus = 0.08 if self._coverage_ratio() < 0.95 else 0.0
+        budget_bonus = 0.05 * remaining_budget_fraction
+
+        return min(0.35, 0.08 + early_bonus + stale_bonus + coverage_bonus + budget_bonus)
+
+    def _choose_size_exploration_target(self, current_subset, step_size):
+        grid = self._size_exploration_grid()
+        if not grid:
+            return max(1, min(len(current_subset), self.n_feats))
+
+        current_size = len(current_subset)
+        min_separation = max(1, int(step_size))
+        candidates = [size for size in grid if abs(size - current_size) >= min_separation]
+        if not candidates:
+            candidates = grid
+
+        counts = getattr(self, "_size_eval_counts", defaultdict(int))
+        min_count = min(counts.get(size, 0) for size in candidates)
+        least_seen = [size for size in candidates if counts.get(size, 0) == min_count]
+
+        if len(least_seen) == 1:
+            return int(least_seen[0])
+        return int(self._rng.choice(least_seen))
+
+    @staticmethod
+    def _seconds_until(deadline):
+        return max(0.0, (deadline - datetime.datetime.now()).total_seconds())
+
+    def _worker_count(self):
+        if self.n_jobs == -1:
+            return max(1, os.cpu_count() or 1)
+        return max(1, int(self.n_jobs))
+
+    def _strict_evaluation_deadline(self, deadline):
+        if not self.strict_budget:
+            return deadline
+        fit_deadline = getattr(self, "_fit_deadline", deadline)
+        cleanup_reserve = getattr(self, "_worker_cleanup_reserve", 0.05)
+        return fit_deadline - datetime.timedelta(seconds=cleanup_reserve)
+
+    def _ensure_evaluation_executor(self):
+        if self._evaluation_executor is None:
+            self._evaluation_executor = [
+                ProcessPoolExecutor(max_workers=1)
+                for _ in range(self._worker_count())
+            ]
+            self._evaluation_worker_ready = [
+                executor.submit(
+                    _initialize_evaluation_worker,
+                    self.X,
+                    self.y,
+                    self.sample_weight,
+                    self.metrics,
+                    self.minimize,
+                    self.n_feats,
+                )
+                for executor in self._evaluation_executor
+            ]
+        return self._evaluation_executor
+
+    def _shutdown_evaluation_executor(self, kill_workers=False, wait_for_workers=True):
+        executor = self._evaluation_executor
+        self._evaluation_executor = None
+        self._evaluation_worker_ready = []
+        if executor is not None:
+            for worker_executor in executor:
+                worker_executor.shutdown(
+                    wait=wait_for_workers,
+                    kill_workers=kill_workers,
+                )
+
+    def _timed_out_result(self, key):
+        default_score = float('inf') if self.minimize else -float('inf')
+        error_marker = (
+            tuple([default_score] * len(self.metrics))
+            if len(self.metrics) > 1
+            else float('inf')
+        )
+        return {
+            "current_scores": [],
+            "any_model": None,
+            "eval_time": 0.0,
+            "current_error": float('inf'),
+            "error_marker": error_marker,
+            "subset_key": key,
+            "cache_hit": False,
+            "timed_out": True,
+        }
+
+    def _estimated_eval_time(self):
+        recent_costs = [
+            float(cost)
+            for cost in getattr(self, "cost_history", [])[-10:]
+            if np.isfinite(cost) and cost > 0
+        ]
+        if recent_costs:
+            return max(1e-3, float(np.median(recent_costs)))
+
+        placeholder = getattr(self, "placeholder_coefficient", None)
+        if placeholder is not None and np.isfinite(placeholder) and placeholder > 0:
+            return max(1e-3, float(placeholder))
+
+        if hasattr(self, "X") and hasattr(self, "n_feats"):
+            data_size = max(1, int(self.X.shape[0])) * max(1, int(self.n_feats))
+            return max(0.05, min(5.0, data_size / 150000.0))
+
+        return 0.05
+
+    def _fresh_eval_capacity(self, deadline):
+        deadline = self._strict_evaluation_deadline(deadline)
+        remaining = self._seconds_until(deadline)
+        if remaining <= 0:
+            return 0
+
+        if self.strict_budget:
+            return self._worker_count()
+
+        estimated_eval_time = self._estimated_eval_time()
+        safety_factor = 1.25
+        required_time = max(1e-3, estimated_eval_time * safety_factor)
+        if remaining < required_time:
+            return 0
+
+        if self.n_jobs > 1:
+            return max(1, min(int(self.n_jobs), int(remaining // required_time)))
+        return 1
+
+    def _budget_limited_batch(self, candidates, deadline):
+        capacity = self._fresh_eval_capacity(deadline)
+        if capacity <= 0:
+            return []
+
+        limited = []
+        fresh_count = 0
+        seen = set()
+
+        for candidate in candidates:
+            key = self._normalize_subset_key(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if key in self._score_cache:
+                limited.append(list(key))
+                continue
+            if fresh_count >= capacity:
+                continue
+            limited.append(list(key))
+            fresh_count += 1
+
+        return limited
+
+    def _compute_fast_feature_priors(self):
+        y = np.asarray(self.y)
+        if not np.issubdtype(y.dtype, np.number):
+            y, _ = pd.factorize(y)
+        y = y.astype(float)
+        y = y - np.mean(y)
+        y_scale = np.linalg.norm(y)
+        if not np.isfinite(y_scale) or y_scale <= 0:
+            return np.ones(self.n_feats) / self.n_feats
+
+        priors = np.zeros(self.n_feats, dtype=float)
+        for idx in range(self.n_feats):
+            column = np.asarray(self.X[:, idx], dtype=float)
+            column = column - np.mean(column)
+            column_scale = np.linalg.norm(column)
+            if np.isfinite(column_scale) and column_scale > 0:
+                priors[idx] = abs(float(np.dot(column, y) / (column_scale * y_scale)))
+
+        max_prior = np.max(priors)
+        if max_prior > 0:
+            return priors / max_prior
+        return np.ones(self.n_feats) / self.n_feats
+
+    def _fallback_subset_from_priors(self):
+        n_default = max(1, min(int(np.sqrt(self.n_feats)), self.n_feats // 2, 10))
+        prior_order = np.argsort(-np.asarray(self.feature_priors, dtype=float))
+        return sorted(map(int, prior_order[:n_default]))
+
     def _cached_result(self, key):
         cached = self._score_cache.get(key)
         if cached is None:
@@ -615,7 +898,7 @@ class FLAVORS2:
         result["cache_hit"] = True
         return result
 
-    def _evaluate_batch(self, subsets):
+    def _evaluate_batch(self, subsets, deadline=None):
         keys = [self._normalize_subset_key(subset) for subset in subsets]
         results_by_key = {}
         missing_keys = []
@@ -629,7 +912,70 @@ class FLAVORS2:
 
         if missing_keys:
             self.cache_misses_ += len(missing_keys)
-            if self.n_jobs > 1 and len(missing_keys) > 1:
+            if self.strict_budget:
+                if deadline is None:
+                    raise ValueError("A deadline is required when strict_budget=True.")
+                deadline = self._strict_evaluation_deadline(deadline)
+                remaining = self._seconds_until(deadline)
+                if remaining <= 0:
+                    computed_by_key = {}
+                    timed_out_keys = set(missing_keys)
+                else:
+                    executors = self._ensure_evaluation_executor()
+                    future_to_key = {
+                        executors[index % len(executors)].submit(
+                            _compute_subset_score_in_worker,
+                            list(key),
+                        ): key
+                        for index, key in enumerate(missing_keys)
+                    }
+                    pending = set(future_to_key)
+                    computed_by_key = {}
+
+                    while pending:
+                        remaining = self._seconds_until(deadline)
+                        if remaining <= 0:
+                            break
+                        done, pending = wait(
+                            pending,
+                            timeout=remaining,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        if not done:
+                            break
+                        for future in done:
+                            key = future_to_key[future]
+                            try:
+                                computed_by_key[key] = future.result()
+                            except Exception as exc:
+                                self._shutdown_evaluation_executor(kill_workers=True)
+                                raise RuntimeError(
+                                    "Candidate evaluation failed in the isolated worker."
+                                ) from exc
+
+                    timed_out_keys = {
+                        future_to_key[future]
+                        for future in pending
+                    }
+                    if timed_out_keys:
+                        self._shutdown_evaluation_executor(
+                            kill_workers=True,
+                            wait_for_workers=False,
+                        )
+
+                if timed_out_keys:
+                    self.timed_out_evaluations_ += len(timed_out_keys)
+                    self.budget_exhausted_ = True
+
+                for key in missing_keys:
+                    if key in timed_out_keys:
+                        results_by_key[key] = self._timed_out_result(key)
+                        continue
+                    result = dict(computed_by_key[key])
+                    result["cache_hit"] = False
+                    self._score_cache[key] = result
+                    results_by_key[key] = result
+            elif self.n_jobs > 1 and len(missing_keys) > 1:
                 parallel = Parallel(n_jobs=self.n_jobs)
                 computed = parallel(delayed(self._compute_subset_score)(
                     list(key), self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
@@ -639,11 +985,12 @@ class FLAVORS2:
                     list(key), self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
                 ) for key in missing_keys]
 
-            for key, result in zip(missing_keys, computed):
-                result = dict(result)
-                result["cache_hit"] = False
-                self._score_cache[key] = result
-                results_by_key[key] = result
+            if not self.strict_budget:
+                for key, result in zip(missing_keys, computed):
+                    result = dict(result)
+                    result["cache_hit"] = False
+                    self._score_cache[key] = result
+                    results_by_key[key] = result
 
         return [dict(results_by_key[key]) for key in keys]
 
@@ -700,6 +1047,9 @@ class FLAVORS2:
         compare real feature importances (from that augmented fit) to the max shadow importance,
         and subtract (shadow_max * |primary_score|) for any feature that loses.
       """
+      if result.get("timed_out", False):
+          return
+
       from sklearn.base import clone as _sk_clone
 
       # ---- Unpack evaluation result
@@ -719,6 +1069,14 @@ class FLAVORS2:
           return
       self.performance_history.append(self.current_error)
       self.cost_history.append(eval_time)
+      subset_size = len(subset)
+      if not hasattr(self, "_size_eval_counts"):
+          self._size_eval_counts = defaultdict(int)
+      if not hasattr(self, "_size_best_errors"):
+          self._size_best_errors = {}
+      self._size_eval_counts[subset_size] += 1
+      previous_size_best = self._size_best_errors.get(subset_size, float('inf'))
+      self._size_best_errors[subset_size] = min(previous_size_best, self.current_error)
 
       # ---- Build feature-specific scores if we have a score payload
       if current_scores:
@@ -945,9 +1303,11 @@ class FLAVORS2:
         n_target_feats = max(1, min(n_target_feats, self.n_feats))
 
         if self.unevaluated:                       # coverage mode
-            k_unseen   = int(np.ceil(0.20 * n_target_feats))           # 20 % of the subset
-            k_unseen   = min(k_unseen, len(self.unevaluated))
-            must_pick  = self._rng.choice(list(self.unevaluated), size=k_unseen, replace=False).tolist() if k_unseen > 0 else []
+            coverage_fraction = getattr(self, "_coverage_subset_fraction", 0.2)
+            k_unseen   = int(np.ceil(coverage_fraction * n_target_feats))
+            k_unseen   = min(k_unseen, len(self.unevaluated), n_target_feats)
+            unseen_pool = np.array(sorted(self.unevaluated), dtype=int)
+            must_pick  = self._rng.choice(unseen_pool, size=k_unseen, replace=False).tolist() if k_unseen > 0 else []
             remaining  = n_target_feats - k_unseen
 
 
@@ -1046,12 +1406,26 @@ class FLAVORS2:
     def _generate_candidate_batch(self, current_subset, batch_size, step_size, remaining_budget_fraction):
         pool_size = max(batch_size, self.candidate_pool_size)
         candidates = []
+        priority_keys = set()
 
         leaderboard_subsets = [list(subset) for _, subset in self.leaderboard[:min(5, len(self.leaderboard))]]
         bases = [list(current_subset)] + leaderboard_subsets
+        coverage_candidate_probability = getattr(self, "_coverage_candidate_probability", 0.0)
+        size_exploration_probability = self._size_exploration_probability(remaining_budget_fraction)
+
+        if self._rng.rand() < size_exploration_probability:
+            target = self._choose_size_exploration_target(current_subset, step_size)
+            candidate = self._random_weighted_subset(target)
+            key = self._normalize_subset_key(candidate)
+            candidates.append(candidate)
+            priority_keys.add(key)
 
         for _ in range(pool_size):
-            if bases and self._rng.rand() > max(0.15, remaining_budget_fraction * 0.25):
+            if self.unevaluated and self._rng.rand() < coverage_candidate_probability:
+                jumps = [-2, -1, 1, 2] if remaining_budget_fraction > 0.2 else [-1, 0, 1]
+                target = max(1, min(self.n_feats, len(current_subset) + int(self._rng.choice(jumps) * max(1, step_size))))
+                candidate = self._random_weighted_subset(target)
+            elif bases and self._rng.rand() > max(0.15, remaining_budget_fraction * 0.25):
                 base = bases[int(self._rng.randint(0, len(bases)))]
                 target = max(1, min(self.n_feats, len(base) + int(self._rng.choice([-1, 0, 1]) * max(1, step_size))))
                 candidate = self._mutate_subset(base, target, step_size)
@@ -1066,14 +1440,29 @@ class FLAVORS2:
             if key not in unique:
                 unique[key] = list(key)
 
-        ranked = sorted(unique.values(), key=self._candidate_score, reverse=True)
+        ranked_all = sorted(unique.values(), key=self._candidate_score, reverse=True)
+        priority_ranked = [
+            candidate for candidate in ranked_all
+            if self._normalize_subset_key(candidate) in priority_keys
+            and self._normalize_subset_key(candidate) not in self._score_cache
+        ]
+        regular_ranked = [
+            candidate for candidate in ranked_all
+            if self._normalize_subset_key(candidate) not in priority_keys
+            and self._normalize_subset_key(candidate) not in self._score_cache
+        ]
+        ranked = priority_ranked + regular_ranked
         if len(ranked) < batch_size:
             attempts = 0
-            while len(ranked) < batch_size and attempts < pool_size * 2:
-                target = max(1, min(self.n_feats, len(current_subset) + int(self._rng.choice([-1, 0, 1]) * max(1, step_size))))
+            while len(ranked) < batch_size and attempts < pool_size * 4:
+                if self._rng.rand() < size_exploration_probability:
+                    target = self._choose_size_exploration_target(current_subset, step_size)
+                else:
+                    jumps = [-2, -1, 0, 1, 2] if self.unevaluated else [-1, 0, 1]
+                    target = max(1, min(self.n_feats, len(current_subset) + int(self._rng.choice(jumps) * max(1, step_size))))
                 candidate = self._random_weighted_subset(target)
                 key = self._normalize_subset_key(candidate)
-                if key not in unique:
+                if key not in unique and key not in self._score_cache:
                     unique[key] = list(key)
                     ranked.append(list(key))
                 attempts += 1
@@ -1089,16 +1478,29 @@ class FLAVORS2:
         main_search_end = end_time - datetime.timedelta(seconds=refinement_duration)
 
         # Initialize performance/counts if not already done (e.g., in fit)
-        if not hasattr(self, 'feature_performance'): self.feature_performance = np.zeros(self.n_feats)
-        if not hasattr(self, 'feature_counts'): self.feature_counts = np.zeros(self.n_feats)
+        if not hasattr(self, 'feature_performance'):
+            self.feature_performance = np.zeros(self.n_feats)
+        if not hasattr(self, 'feature_counts'):
+            self.feature_counts = np.zeros(self.n_feats)
 
         # Initial subset size heuristic
         if not hasattr(self, 'num_features') or not self.fitted:
             self.num_features = max(1, min(int(np.sqrt(self.n_feats)), self.n_feats // 2, 10)) # Start small/medium
 
         # Generate and evaluate initial subset
+        self._set_coverage_pressure(1.0, force=True)
         current_subset = self.search_strategy(self.num_features)
-        result = self._evaluate_batch([current_subset])[0]
+        if self._fresh_eval_capacity(end_time) <= 0:
+            fallback_subset = self._fallback_subset_from_priors()
+            self.leaderboard.append((float('inf'), fallback_subset))
+            self.best_error = float('inf')
+            return
+        result = self._evaluate_batch([current_subset], deadline=end_time)[0]
+        if result.get("timed_out", False):
+            fallback_subset = self._fallback_subset_from_priors()
+            self.leaderboard.append((float('inf'), fallback_subset))
+            self.best_error = float('inf')
+            return
         self._update_after_evaluation(result, current_subset, [])
 
         # Initialize best error if first run (using lower-is-better convention)
@@ -1113,14 +1515,21 @@ class FLAVORS2:
         with parallel_backend('loky'):
             while datetime.datetime.now() < main_search_end:
                 remaining_time = (main_search_end - datetime.datetime.now()).total_seconds()
-                if remaining_time <= 0: break # Exit if time is up
+                if remaining_time <= 0:
+                    break # Exit if time is up
                 remaining_budget_fraction = max(0.0, remaining_time / max(1e-9, (main_search_end - start_time).total_seconds()))
+                coverage_target = self._coverage_target(budget)
+                force_coverage = self._coverage_ratio() < coverage_target and remaining_budget_fraction > 0.2
+                self._set_coverage_pressure(remaining_budget_fraction, force=force_coverage)
 
                 step_size = self.adjust_step_size(self.num_features, remaining_budget_fraction)
                 batch_subsets = self._generate_candidate_batch(
                     current_subset, batch_size, step_size, remaining_budget_fraction
                 )
-                batch_results = self._evaluate_batch(batch_subsets)
+                batch_subsets = self._budget_limited_batch(batch_subsets, main_search_end)
+                if not batch_subsets:
+                    break
+                batch_results = self._evaluate_batch(batch_subsets, deadline=main_search_end)
 
                 # Process results sequentially
                 improved = False
@@ -1163,16 +1572,62 @@ class FLAVORS2:
                     # Generate and evaluate restart subset
                     current_subset = self.search_strategy(restart_features)
                     self.num_features = len(current_subset)
-                    result = self._evaluate_batch([current_subset])[0]
+                    if self._fresh_eval_capacity(main_search_end) <= 0:
+                        break
+                    result = self._evaluate_batch([current_subset], deadline=main_search_end)[0]
                     self._update_after_evaluation(result, current_subset, current_subset)  # Previous is itself for restart
                     no_improvement_counter = 0
+
+        # If coverage is still thin, spend most of the reserved tail exploring before refinement.
+        min_refinement_duration = min(refinement_duration, max(0.0, budget * 0.03))
+        coverage_target = self._coverage_target(budget)
+        coverage_catchup_end = end_time - datetime.timedelta(seconds=min_refinement_duration)
+        with parallel_backend('loky'):
+            while datetime.datetime.now() < coverage_catchup_end and self._coverage_ratio() < coverage_target:
+                remaining_time = (coverage_catchup_end - datetime.datetime.now()).total_seconds()
+                if remaining_time <= 0:
+                    break
+                remaining_budget_fraction = max(0.0, remaining_time / max(1e-9, (coverage_catchup_end - start_time).total_seconds()))
+                self._set_coverage_pressure(remaining_budget_fraction, force=True)
+
+                step_size = self.adjust_step_size(self.num_features, remaining_budget_fraction)
+                batch_subsets = self._generate_candidate_batch(
+                    current_subset, batch_size, step_size, remaining_budget_fraction
+                )
+                batch_subsets = self._budget_limited_batch(batch_subsets, coverage_catchup_end)
+                if not batch_subsets:
+                    break
+                batch_results = self._evaluate_batch(batch_subsets, deadline=coverage_catchup_end)
+
+                improved = False
+                best_in_batch_error = float('inf')
+                best_in_batch_subset = None
+                prev_error = self.current_error
+
+                for idx, result in enumerate(batch_results):
+                    subset = batch_subsets[idx]
+                    self._update_after_evaluation(result, subset, current_subset)
+
+                    if self.current_error < prev_error:
+                        improved = True
+                        if self.current_error < best_in_batch_error:
+                            best_in_batch_error = self.current_error
+                            best_in_batch_subset = subset
+
+                if improved:
+                    current_subset = best_in_batch_subset[:]
+                    self.num_features = len(current_subset)
+                    no_improvement_counter = 0
+                else:
+                    no_improvement_counter += batch_size
 
         # --- Refinement Phase ---
         # Focus search around the best solution found so far using local moves
         refine_start_time = datetime.datetime.now()
         with parallel_backend('loky'):
             while datetime.datetime.now() < end_time:
-                 if not self.leaderboard: break # Exit if no solution found
+                 if not self.leaderboard:
+                     break # Exit if no solution found
 
                  # Get the current best subset from leaderboard
                  # Sort leaderboard by error (lower is better)
@@ -1221,7 +1676,22 @@ class FLAVORS2:
                      else:
                          batch_subsets_refine.append(best_subset_refine)  # Fallback
 
-                 batch_results = self._evaluate_batch(batch_subsets_refine)
+                 fresh_refine = []
+                 seen_refine = set()
+                 for candidate in batch_subsets_refine:
+                     key = self._normalize_subset_key(candidate)
+                     if key not in self._score_cache and key not in seen_refine:
+                         seen_refine.add(key)
+                         fresh_refine.append(list(key))
+
+                 if not fresh_refine:
+                     break
+
+                 batch_subsets_refine = fresh_refine[:batch_size]
+                 batch_subsets_refine = self._budget_limited_batch(batch_subsets_refine, end_time)
+                 if not batch_subsets_refine:
+                     break
+                 batch_results = self._evaluate_batch(batch_subsets_refine, deadline=end_time)
 
                  # Process results
                  for idx, result in enumerate(batch_results):
@@ -1274,10 +1744,20 @@ class FLAVORS2:
         self.budget = budget if budget is not None else self.budget
         if self.budget is None:
              raise ValueError("Budget must be provided either during initialization or fit.")
+        fit_start_time = datetime.datetime.now()
+        self._fit_deadline = fit_start_time + datetime.timedelta(seconds=float(self.budget))
+        self._worker_cleanup_reserve = min(
+            0.1,
+            max(0.05, float(self.budget) * 0.1),
+            max(0.0, float(self.budget) * 0.5),
+        )
+        self._shutdown_evaluation_executor(kill_workers=True)
+        self.timed_out_evaluations_ = 0
+        self.budget_exhausted_ = False
 
         # Validate inputs using sklearn utilities
-        X = check_array(X, ensure_2d=True, force_all_finite=True)
-        y = check_array(y, ensure_2d=False, force_all_finite=True, ensure_min_samples=1)
+        X = _check_finite_array(X, ensure_2d=True)
+        y = _check_finite_array(y, ensure_2d=False, ensure_min_samples=1)
         if X.shape[0] != y.shape[0]:
             raise ValueError("X and y must have the same number of samples.")
 
@@ -1302,6 +1782,8 @@ class FLAVORS2:
             self.cache_hits_ = 0
             self.cache_misses_ = 0
             self.loop_results_ = 0
+            self._size_eval_counts = defaultdict(int)
+            self._size_best_errors = {}
             # Reset performance/stability tracking
             self.feature_performance = np.zeros(self.n_feats)
             self.feature_counts = np.zeros(self.n_feats)
@@ -1329,23 +1811,8 @@ class FLAVORS2:
 
             # Calculate feature priors (e.g., using mutual information)
             if self.feature_priors is None or len(self.feature_priors) != self.n_feats:
-                print("...")
-                # Check if classification or regression task based on y
-                # Heuristic: if y has few unique values and is integer type
-                if len(np.unique(self.y)) <= max(10, self.X.shape[0] * 0.1) and np.issubdtype(self.y.dtype, np.integer):
-                    print("(Assuming classifiCalculating initial feature priors using mutual informationcation task for MI)")
-                    # Added random_state for reproducibility
-                    self.feature_priors = mutual_info_classif(self.X, self.y, discrete_features='auto', random_state=42, n_jobs=self.n_jobs)
-                else:
-                    print("(Assuming regression task for MI)")
-                    self.feature_priors = mutual_info_regression(self.X, self.y, discrete_features='auto', random_state=42, n_jobs=self.n_jobs)
-
-                # Normalize priors to be between 0 and 1 (optional, but good practice)
-                min_prior, max_prior = np.min(self.feature_priors), np.max(self.feature_priors)
-                if max_prior > min_prior:
-                     self.feature_priors = (self.feature_priors - min_prior) / (max_prior - min_prior)
-                else:
-                     self.feature_priors = np.ones(self.n_feats) / self.n_feats # Uniform if MI is constant
+                print("Calculating fast feature priors.")
+                self.feature_priors = self._compute_fast_feature_priors()
 
             # Initialize multi-objective tracking if needed
             if len(self.metrics) > 1:
@@ -1366,8 +1833,26 @@ class FLAVORS2:
 
 
         # --- Run the main search ---
-        print(f"Starting feature selection search with budget: {self.budget} seconds...")
-        self.select_best_feature_subset(self.budget)
+        elapsed_before_search = (datetime.datetime.now() - fit_start_time).total_seconds()
+        search_budget = max(0.0, float(self.budget) - elapsed_before_search)
+        print(f"Starting feature selection search with budget: {search_budget:.6f} seconds...")
+        try:
+            if search_budget >= 0.05:
+                self.select_best_feature_subset(search_budget)
+            elif not self.leaderboard:
+                fallback_subset = self._fallback_subset_from_priors()
+                self.leaderboard.append((float('inf'), fallback_subset))
+                self.best_error = float('inf')
+        finally:
+            urgent_shutdown = (
+                self.strict_budget
+                or self.budget_exhausted_
+                or self._seconds_until(self._fit_deadline) <= self._worker_cleanup_reserve
+            )
+            self._shutdown_evaluation_executor(
+                kill_workers=urgent_shutdown,
+                wait_for_workers=not urgent_shutdown,
+            )
         print("Search finished.")
 
         if not self.leaderboard:
@@ -1416,13 +1901,9 @@ class FLAVORS2:
         return X[:, best_subset_indices]
 
 
-from sklearn.base import BaseEstimator, TransformerMixin
-import numpy as np
-import pandas as pd
-
 class FLAVORS2FeatureSelector(BaseEstimator, TransformerMixin):
     def __init__(self, budget=30, minimize=False, metrics=None, c_sub=4, feature_priors=None, n_jobs=1,
-                 boruta=False, random_state=42):
+                 boruta=False, random_state=42, strict_budget=True):
         self.budget = budget
         self.minimize = minimize
         self.metrics = metrics
@@ -1431,6 +1912,7 @@ class FLAVORS2FeatureSelector(BaseEstimator, TransformerMixin):
         self.n_jobs = n_jobs
         self.boruta = boruta
         self.random_state = random_state
+        self.strict_budget = strict_budget
 
         # sklearn-style fitted attributes (initialized here for clarity)
         self.selector = None
@@ -1456,7 +1938,8 @@ class FLAVORS2FeatureSelector(BaseEstimator, TransformerMixin):
             feature_priors=self.feature_priors,
             n_jobs=self.n_jobs,
             boruta=self.boruta,
-            random_state=self.random_state
+            random_state=self.random_state,
+            strict_budget=self.strict_budget,
         )
         # Fit underlying searcher (passes sample_weight through)
         self.selector.fit(X, y, sample_weight=sample_weight)

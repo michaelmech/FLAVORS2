@@ -37,7 +37,13 @@ X_selected = selector.transform(X)
 print(f"Selected feature indices: {selector.selected_indices_}")
 ```
 
-This performs a budgeted search for the optimal subset using default metrics (AUC for classification or R² for regression).
+This performs a budgeted search for the optimal subset using classifier accuracy by default.
+
+### Strict Time Budgets
+
+Candidate evaluations run in isolated worker processes by default and are terminated when the remaining wall-clock budget expires.
+The selector reserves up to 100 milliseconds of the requested budget for worker cleanup.
+Set `strict_budget=False` to retain cooperative in-process evaluation behavior.
 
 ## Advanced Usage
 
