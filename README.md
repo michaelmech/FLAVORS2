@@ -169,6 +169,29 @@ selector = FLAVORS2FeatureSelector(
 
 ```
 
+### Cost-Frugal Stochastic Search
+
+FLAVORS2 allocates its evaluation budget across local mutation, global size exploration, soft importance-ranked sampling, and uncertainty sampling.
+The allocation adapts to the score improvement produced per second by each proposal strategy.
+It also maintains a diverse population of strong subsets so local proposals are not restricted to one greedy trajectory.
+
+Importance-ranked proposals remain stochastic and do not permanently eliminate features.
+Global and uncertainty proposals continue to reconsider excluded features throughout the search.
+
+A metric may provide fold-aggregated importances directly:
+
+```python
+def metric_with_importances(X, y, sample_weight=None):
+    score, importances = evaluate_with_cross_validation(X, y, sample_weight)
+    return {
+        "score": score,
+        "feature_importances": importances,
+    }
+```
+
+The importance vector must be one-dimensional and match the columns in the evaluated subset.
+FLAVORS2 uses importance magnitude as feature evidence and keeps it separate from metric direction, so negative scores and minimized losses do not reverse importance rankings.
+
 ## Benchmarks
 
 FLAVORS2 outperforms baselines in rankings and wins:

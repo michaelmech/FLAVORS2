@@ -103,6 +103,7 @@ def ensure_metric_protocol(metric):
       - accepts signature (X, y, sample_weight=None)
       - returns a dict with at least {'score': float}
       - if the original returns a number, coerce to {'score': number}
+      - normalizes optional one-dimensional 'feature_importances'
     """
     sig = inspect.signature(metric)
     params = list(sig.parameters.values())
@@ -126,6 +127,13 @@ def ensure_metric_protocol(metric):
         # Make sure score is a float
         out = dict(out)
         out["score"] = float(out["score"])
+        if "feature_importances" in out:
+            importances = np.asarray(out["feature_importances"], dtype=float)
+            if importances.ndim != 1:
+                raise ValueError("Metric 'feature_importances' must be a one-dimensional array.")
+            if not np.all(np.isfinite(importances)):
+                raise ValueError("Metric 'feature_importances' must contain only finite values.")
+            out["feature_importances"] = importances
         return out
 
     return wrapped
@@ -169,6 +177,13 @@ class FLAVORS2:
         self.candidate_pool_size = max(8, 4 * max(1, n_jobs))
         self._size_eval_counts = defaultdict(int)
         self._size_best_errors = {}
+        self._size_error_history = defaultdict(list)
+        self._elite_candidates = {}
+        self._candidate_strategies = {}
+        self._proposal_stats = {
+            name: {"trials": 0, "improvement": 0.0, "cost": 0.0}
+            for name in ("local", "global", "ranked", "uncertain")
+        }
         self._evaluation_executor = None
         self.timed_out_evaluations_ = 0
         self.budget_exhausted_ = False
@@ -268,6 +283,34 @@ class FLAVORS2:
                 imp = np.abs(coefs).ravel()
             return imp
         return None
+
+    @staticmethod
+    def _normalize_importance_evidence(importances):
+        """Return direction-free importance evidence on a stable zero-to-one scale."""
+        values = np.abs(np.asarray(importances, dtype=float).ravel())
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        maximum = float(np.max(values)) if values.size else 0.0
+        if maximum <= 1e-12:
+            return np.zeros_like(values)
+        return values / maximum
+
+    @staticmethod
+    def _subset_quality(current_error, prior_errors):
+        """Estimate how good a subset is relative to previously tested equal sizes."""
+        finite_prior = np.asarray(
+            [error for error in prior_errors if np.isfinite(error)],
+            dtype=float,
+        )
+        if not np.isfinite(current_error) or finite_prior.size == 0:
+            return 0.5
+        return float((np.sum(finite_prior >= current_error) + 0.5) / (finite_prior.size + 1.0))
+
+    @classmethod
+    def _feature_evidence(cls, importances, subset_quality):
+        """Combine model evidence and subset quality without using raw metric direction."""
+        normalized = cls._normalize_importance_evidence(importances)
+        quality = max(0.0, min(1.0, float(subset_quality)))
+        return (0.2 + 0.8 * quality) * (0.1 + 0.9 * normalized)
 
     @staticmethod
     def _make_shadow_features(X_subset, n_shadow, rng):
@@ -399,41 +442,45 @@ class FLAVORS2:
         if not hasattr(self, 'feature_counts') or self.feature_counts is None:
             self.feature_counts = np.zeros(self.n_feats)
 
-        # Iterate over each feature and its specific score from the latest evaluation
-        for feat, performance in feature_scores.items():
-            # Ensure performance is a finite number BEFORE calculating performance_score
-            if performance is None or not np.isfinite(performance):
-                 continue
+        valid_scores = {
+            int(feat): float(performance)
+            for feat, performance in feature_scores.items()
+            if 0 <= int(feat) < self.n_feats
+            and performance is not None
+            and np.isfinite(performance)
+        }
+        if not valid_scores:
+            return
 
-            # Determine score based on optimization direction (lower is better internally)
-            performance_score = -performance if self.minimize else performance
-            if not np.isfinite(performance_score):
-                 continue
+        # Update the normalization range once per evaluation. Updating it inside
+        # the feature loop makes the result depend on feature-index order.
+        scores = np.asarray(list(valid_scores.values()), dtype=float)
+        batch_min = float(np.min(scores))
+        batch_max = float(np.max(scores))
+        if getattr(self, "min_performance", None) is None or getattr(self, "max_performance", None) is None:
+            self.min_performance = batch_min
+            self.max_performance = batch_max
+        else:
+            self.min_performance = min(float(self.min_performance), batch_min)
+            self.max_performance = max(float(self.max_performance), batch_max)
 
-            # --- Initialize or update global min/max of per-feature scores ---
-            if not hasattr(self, 'min_performance') or self.min_performance is None or \
-               not hasattr(self, 'max_performance') or self.max_performance is None:
-                self.min_performance = performance_score
-                self.max_performance = performance_score
+        performance_range = float(self.max_performance - self.min_performance)
+        for feat, performance_score in valid_scores.items():
+            if performance_range > 1e-9:
+                normalized = (performance_score - self.min_performance) / performance_range
             else:
-                self.min_performance = min(self.min_performance, performance_score)
-                self.max_performance = max(self.max_performance, performance_score)
+                normalized = 0.5
 
-            # --- Normalize the feature's performance score ---
-            if not isinstance(self.min_performance, (int, float, np.number)) or \
-               not isinstance(self.max_performance, (int, float, np.number)):
-                 norm_performance = 0.5 # Default normalization if state is unexpected
-            else:
-                 range_perf = self.max_performance - self.min_performance
-                 # Avoid division by zero if range is too small
-                 norm_performance = (performance_score - self.min_performance) / max(range_perf, 1e-9) if range_perf > 1e-9 else 0.5
-
-            # --- Update performance for the feature using Exponential Moving Average (EMA) ---
-            if 0 <= feat < self.n_feats:
-                 self.feature_counts[feat] += 1
-                 alpha = 0.1 # Smoothing factor (adjust as needed)
-                 current_perf = float(self.feature_performance[feat]) if np.isfinite(self.feature_performance[feat]) else 0.0
-                 self.feature_performance[feat] = alpha * norm_performance + (1 - alpha) * current_perf
+            old_count = float(self.feature_counts[feat])
+            new_count = old_count + 1.0
+            # Learn quickly from the first costly evaluations, then retain a
+            # modest EMA floor so the search can adapt as feature context changes.
+            alpha = max(0.15, 1.0 / new_count)
+            current = float(self.feature_performance[feat])
+            if not np.isfinite(current):
+                current = 0.0
+            self.feature_performance[feat] = alpha * normalized + (1.0 - alpha) * current
+            self.feature_counts[feat] = new_count
 
         # Update feature stability based on leaderboard changes
         self.update_feature_stability()
@@ -562,6 +609,7 @@ class FLAVORS2:
              return {
                  'current_scores': [default_score] * len(metrics),
                  'any_model': None,
+                 'feature_importances': None,
                  'eval_time': eval_time,
                  'current_error': current_error,
                  'error_marker': error_marker,
@@ -583,6 +631,7 @@ class FLAVORS2:
             return {
                  'current_scores': [default_score] * len(metrics),
                  'any_model': None,
+                 'feature_importances': None,
                  'eval_time': eval_time,
                  'current_error': current_error,
                  'error_marker': error_marker,
@@ -593,6 +642,7 @@ class FLAVORS2:
 
         current_scores = []
         any_model = None  # Holder for a model returned by a metric
+        feature_importances = None
 
         if len(metrics) > 1:
             tuple_metric = []
@@ -602,6 +652,8 @@ class FLAVORS2:
                 current_scores.append(score)
                 if "model" in res and any_model is None:
                     any_model = res["model"]
+                if "feature_importances" in res and feature_importances is None:
+                    feature_importances = res["feature_importances"]
                 # Adjust for direction: higher is better after this line
                 adjusted = -score if (isinstance(minimize, bool) and minimize) else score
                 tuple_metric.append(adjusted)
@@ -617,14 +669,21 @@ class FLAVORS2:
             score = float(res["score"])
             current_scores.append(score)
             any_model = res.get("model", None)
+            feature_importances = res.get("feature_importances", None)
             current_error = -score if not minimize else score
             error_marker = current_error
+
+        if feature_importances is not None and len(feature_importances) != len(subset):
+            raise ValueError(
+                "Metric 'feature_importances' length must match the evaluated feature subset."
+            )
 
         eval_time = (datetime.datetime.now() - start).total_seconds()
 
         return {
             'current_scores': current_scores,
             'any_model': any_model,
+            'feature_importances': feature_importances,
             'eval_time': eval_time,
             'current_error': current_error,
             'error_marker': error_marker,
@@ -695,6 +754,8 @@ class FLAVORS2:
             int(np.ceil(0.30 * self.n_feats)),
             int(np.ceil(0.50 * self.n_feats)),
             int(np.ceil(0.70 * self.n_feats)),
+            int(np.ceil(0.85 * self.n_feats)),
+            self.n_feats,
         }
         return sorted(max(1, min(self.n_feats, size)) for size in base_sizes)
 
@@ -790,6 +851,7 @@ class FLAVORS2:
         return {
             "current_scores": [],
             "any_model": None,
+            "feature_importances": None,
             "eval_time": 0.0,
             "current_error": float('inf'),
             "error_marker": error_marker,
@@ -883,8 +945,11 @@ class FLAVORS2:
             return priors / max_prior
         return np.ones(self.n_feats) / self.n_feats
 
+    def _initial_subset_size(self):
+        return max(1, min(self.n_feats, int(np.ceil(2 * np.sqrt(self.n_feats)))))
+
     def _fallback_subset_from_priors(self):
-        n_default = max(1, min(int(np.sqrt(self.n_feats)), self.n_feats // 2, 10))
+        n_default = self._initial_subset_size()
         prior_order = np.argsort(-np.asarray(self.feature_priors, dtype=float))
         return sorted(map(int, prior_order[:n_default]))
 
@@ -1055,6 +1120,7 @@ class FLAVORS2:
       # ---- Unpack evaluation result
       current_scores   = result.get('current_scores')
       any_model        = result.get('any_model')
+      explicit_importances = result.get('feature_importances')
       eval_time        = result.get('eval_time', 0.0)
       self.current_error = result.get('current_error')
       self.error_marker  = result.get('error_marker')
@@ -1074,28 +1140,33 @@ class FLAVORS2:
           self._size_eval_counts = defaultdict(int)
       if not hasattr(self, "_size_best_errors"):
           self._size_best_errors = {}
+      if not hasattr(self, "_size_error_history"):
+          self._size_error_history = defaultdict(list)
       self._size_eval_counts[subset_size] += 1
       previous_size_best = self._size_best_errors.get(subset_size, float('inf'))
+      prior_size_errors = list(self._size_error_history[subset_size])
+      subset_quality = self._subset_quality(self.current_error, prior_size_errors)
       self._size_best_errors[subset_size] = min(previous_size_best, self.current_error)
+      self._size_error_history[subset_size].append(self.current_error)
+      self._record_elite_candidate(subset, self.current_error)
+      self._record_proposal_result(subset_key, self.current_error, previous_size_best, eval_time)
 
       # ---- Build feature-specific scores if we have a score payload
       if current_scores:
-          # Primary score can be list/tuple or dict (prefers 'score')
-          if isinstance(current_scores, dict):
-              primary_score = current_scores.get('score', next(iter(current_scores.values())))
+          # Prefer metric-supplied importances, then fall back to the returned model.
+          if explicit_importances is not None:
+              model_importances = np.asarray(explicit_importances, dtype=float).ravel()
           else:
-              primary_score = current_scores[0]
-          primary_score = float(primary_score)
+              model_importances = self._extract_importances(any_model) if any_model is not None else None
 
-          # Extract importances from the model we just evaluated (non-augmented)
-          model_importances = self._extract_importances(any_model) if any_model is not None else None
-
-          # Base propagation: importance * primary_score, else uniform primary_score
+          # Importances describe feature evidence, while the metric describes
+          # subset quality. Keep their directions separate so negative scores
+          # and minimized losses cannot reverse the feature ordering.
           if (model_importances is not None) and (len(model_importances) == len(subset)):
-              weighted_importances = np.asarray(model_importances, float).ravel() * primary_score
-              feature_scores = dict(zip(subset, weighted_importances))
+              evidence = self._feature_evidence(model_importances, subset_quality)
+              feature_scores = dict(zip(subset, evidence))
           else:
-              feature_scores = {feat: primary_score for feat in subset}
+              feature_scores = {feat: subset_quality for feat in subset}
 
           # ---- Boruta-style penalty (optional)
           if self.boruta and len(subset) > 0:
@@ -1124,10 +1195,11 @@ class FLAVORS2:
                           shadow_imps   = np.asarray(imp_aug[-n_shadow:], float)
 
                           if shadow_imps.size > 0 and np.isfinite(shadow_imps).any():
-                              shadow_max = float(np.nanmax(shadow_imps))
-                              penalty = shadow_max * abs(primary_score)
+                              importance_scale = max(float(np.nanmax(np.abs(imp_aug))), 1e-12)
+                              shadow_max = float(np.nanmax(np.abs(shadow_imps))) / importance_scale
+                              penalty = 0.25 * (0.2 + 0.8 * subset_quality)
 
-                              weak_mask = (real_imps_aug < shadow_max)
+                              weak_mask = (np.abs(real_imps_aug) / importance_scale < shadow_max)
                               if np.any(weak_mask):
                                   for local_idx, is_weak in enumerate(weak_mask):
                                       if is_weak:
@@ -1147,6 +1219,8 @@ class FLAVORS2:
       # ---- Keep last produced model for inspection
       if any_model is not None:
           self.last_metric_model_ = any_model
+      if explicit_importances is not None:
+          self.last_metric_feature_importances_ = np.asarray(explicit_importances, dtype=float).copy()
 
       # ---- Drive the search state machine and housekeeping
       self.update_search(previous_subset, subset, eval_time)
@@ -1242,6 +1316,145 @@ class FLAVORS2:
 
         return step_size
 
+    def _feature_desirability(self):
+        """Blend priors and learned evidence according to observation reliability."""
+        priors = np.asarray(self.feature_priors, dtype=float)
+        priors = np.nan_to_num(priors, nan=0.0, posinf=0.0, neginf=0.0)
+        prior_max = float(np.max(priors)) if priors.size else 0.0
+        if prior_max > 0:
+            priors = priors / prior_max
+        else:
+            priors = np.ones(self.n_feats, dtype=float)
+
+        performance = np.asarray(self.feature_performance, dtype=float)
+        performance = np.clip(
+            np.nan_to_num(performance, nan=0.0, posinf=1.0, neginf=0.0),
+            0.0,
+            1.0,
+        )
+        counts = np.asarray(self.feature_counts, dtype=float)
+        reliability = counts / (counts + 3.0)
+        desirability = reliability * performance + (1.0 - reliability) * priors
+
+        stability = np.asarray(getattr(self, "feature_stability", np.zeros(self.n_feats)), dtype=float)
+        stability = np.nan_to_num(stability, nan=0.0, posinf=0.0, neginf=0.0)
+        stability_max = float(np.max(stability)) if stability.size else 0.0
+        if stability_max > 0:
+            desirability = 0.9 * desirability + 0.1 * (stability / stability_max)
+        return np.maximum(desirability, 1e-9)
+
+    def _record_elite_candidate(self, subset, error):
+        """Keep a compact population of strong subsets, including per-size elites."""
+        if not np.isfinite(error):
+            return
+        if not hasattr(self, "_elite_candidates"):
+            self._elite_candidates = {}
+        key = self._normalize_subset_key(subset)
+        self._elite_candidates[key] = min(float(error), self._elite_candidates.get(key, float("inf")))
+
+        if len(self._elite_candidates) <= 96:
+            return
+        ranked = sorted(self._elite_candidates.items(), key=lambda item: item[1])
+        keep = dict(ranked[:48])
+        for candidate, candidate_error in ranked:
+            size = len(candidate)
+            if not any(len(existing) == size for existing in keep):
+                keep[candidate] = candidate_error
+        self._elite_candidates = keep
+
+    def _diverse_elite_subsets(self, limit=8):
+        """Return strong subsets while avoiding a population of near-duplicates."""
+        ranked = sorted(
+            getattr(self, "_elite_candidates", {}).items(),
+            key=lambda item: item[1],
+        )
+        selected = []
+        for candidate, _ in ranked:
+            candidate_set = set(candidate)
+            if all(
+                len(candidate_set & set(existing)) / max(1, len(candidate_set | set(existing))) < 0.85
+                for existing in selected
+            ):
+                selected.append(list(candidate))
+            if len(selected) >= limit:
+                break
+        if len(selected) < limit:
+            for candidate, _ in ranked:
+                candidate_list = list(candidate)
+                if candidate_list not in selected:
+                    selected.append(candidate_list)
+                if len(selected) >= limit:
+                    break
+        return selected
+
+    def _record_proposal_result(self, subset_key, error, previous_size_best, eval_time):
+        strategy = getattr(self, "_candidate_strategies", {}).pop(subset_key, None)
+        if strategy is None:
+            return
+        stats = self._proposal_stats[strategy]
+        stats["trials"] += 1
+        stats["cost"] += max(0.0, float(eval_time))
+
+        size_improvement = 0.0
+        if np.isfinite(previous_size_best):
+            size_improvement = max(0.0, float(previous_size_best - error))
+        global_improvement = 0.0
+        if np.isfinite(getattr(self, "best_error", float("inf"))):
+            global_improvement = max(0.0, float(self.best_error - error))
+        stats["improvement"] += global_improvement + 0.2 * size_improvement
+
+    def _proposal_probabilities(self, remaining_budget_fraction=1.0):
+        names = ("local", "global", "ranked", "uncertain")
+        base = np.asarray([0.30, 0.22, 0.33, 0.15], dtype=float)
+        remaining = max(0.0, min(1.0, float(remaining_budget_fraction)))
+        base[0] += 0.15 * (1.0 - remaining)
+        base[1] *= 0.6 + 0.4 * remaining
+        base[3] *= 0.7 + 0.3 * remaining
+        efficiencies = np.asarray([
+            self._proposal_stats[name]["improvement"]
+            / max(self._proposal_stats[name]["cost"], 1e-9)
+            for name in names
+        ])
+        maximum = float(np.max(efficiencies)) if efficiencies.size else 0.0
+        normalized_efficiency = efficiencies / maximum if maximum > 0 else efficiencies
+        trials = np.asarray([self._proposal_stats[name]["trials"] for name in names], dtype=float)
+        exploration = 1.0 / np.sqrt(trials + 1.0)
+        weights = base * (1.0 + 0.75 * normalized_efficiency) + 0.08 * exploration
+        return names, weights / np.sum(weights)
+
+    def _ranked_candidate(self, n_target_feats):
+        """Sample near the learned ranking without creating an irreversible path."""
+        n_target_feats = max(1, min(int(n_target_feats), self.n_feats))
+        desirability = self._feature_desirability()
+        order = np.argsort(-desirability)
+        pool_size = min(self.n_feats, max(n_target_feats + 2, int(np.ceil(1.5 * n_target_feats))))
+        pool = order[:pool_size]
+        probabilities = desirability[pool]
+        probabilities = probabilities / np.sum(probabilities)
+        selected = self._rng.choice(
+            pool,
+            size=n_target_feats,
+            replace=False,
+            p=probabilities,
+        )
+        return sorted(map(int, selected))
+
+    def _uncertain_candidate(self, n_target_feats):
+        n_target_feats = max(1, min(int(n_target_feats), self.n_feats))
+        counts = np.asarray(self.feature_counts, dtype=float)
+        uncertainty = 1.0 / np.sqrt(counts + 1.0)
+        desirability = self._feature_desirability()
+        desirability = desirability / np.max(desirability)
+        weights = 0.65 * uncertainty + 0.35 * desirability
+        weights = weights / np.sum(weights)
+        selected = self._rng.choice(
+            self.n_feats,
+            size=n_target_feats,
+            replace=False,
+            p=weights,
+        )
+        return sorted(map(int, selected))
+
     def search_strategy(self, n_target_feats):
         # Ensure feature weights/priors are initialized
         if not hasattr(self, 'feature_priors') or self.feature_priors is None:
@@ -1255,37 +1468,23 @@ class FLAVORS2:
             self.feature_stability = np.zeros(self.n_feats)
 
 
-        weights = np.ones(self.n_feats) * 1e-9 # Start with small positive weights
+        # Shrink learned evidence toward the prior according to how often each
+        # feature has been observed. This uses expensive evidence immediately
+        # without allowing one evaluation to dominate the search.
+        base_weights = self._feature_desirability()
 
-        # Combine signals: priors, performance, stability, cost
-        iters = self.iters if hasattr(self, 'iters') else 0
-
-        # Performance weight increases with iterations (exploitation)
-        # Ensure feature_performance is normalized (0 to 1 ideally)
-        perf_norm = self.feature_performance # Assume already normalized (0=worst, 1=best)
-        # Simple linear weight increase for exploitation, capped at 0.7
-        exploit_weight = min(0.7, iters / 100.0) if iters > 10 else 0.0
-
-        # Stability weight (use if available and stable)
-        stab_weight = 0.1 if np.sum(self.feature_stability) > 0 else 0.0
-
-        # Prior weight (exploration, decreases initially)
-        prior_weight = max(0.1, 1.0 - exploit_weight - stab_weight)
-
-        # Combine base weights
-        base_weights = (prior_weight * self.feature_priors +
-                        exploit_weight * perf_norm +
-                        stab_weight * self.feature_stability)
-
-
-        # Factor in feature cost (lower cost = higher weight)
+        # Factor in feature cost (lower cost = higher weight).
         if hasattr(self, 'feature_cost_history') and self.feature_cost_history:
             costs = np.array([self.feature_cost_history.get(feat, 1.0) for feat in range(self.n_feats)])
-             # Add small epsilon to avoid division by zero, dampen effect with sqrt
+            # Add small epsilon to avoid division by zero, dampen effect with sqrt.
             cost_factor = 1.0 / (np.sqrt(np.maximum(costs, 1e-9)) + 0.1)
             weights = base_weights * cost_factor
         else:
             weights = base_weights
+
+        # A uniform component prevents cost and importance estimates from
+        # making any feature effectively unreachable.
+        weights = 0.85 * weights + 0.15 * float(np.mean(weights))
 
         # Ensure weights are positive and finite
         weights = np.maximum(weights, 1e-9)
@@ -1344,10 +1543,7 @@ class FLAVORS2:
         n_target_feats = max(1, min(int(n_target_feats), self.n_feats))
         step_size = max(1, int(step_size))
 
-        perf = self.feature_performance if hasattr(self, "feature_performance") else np.zeros(self.n_feats)
-        priors = self.feature_priors if hasattr(self, "feature_priors") else np.ones(self.n_feats) / self.n_feats
-        desirability = 0.65 * np.asarray(perf, dtype=float) + 0.35 * np.asarray(priors, dtype=float)
-        desirability = np.nan_to_num(desirability, nan=0.0, posinf=0.0, neginf=0.0)
+        desirability = self._feature_desirability()
 
         current = set(base)
         if len(current) > n_target_feats:
@@ -1392,10 +1588,7 @@ class FLAVORS2:
         if subset in self._score_cache:
             return float("-inf")
 
-        perf = self.feature_performance if hasattr(self, "feature_performance") else np.zeros(self.n_feats)
-        priors = self.feature_priors if hasattr(self, "feature_priors") else np.ones(self.n_feats) / self.n_feats
-        values = 0.55 * np.asarray(perf, dtype=float) + 0.45 * np.asarray(priors, dtype=float)
-        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        values = self._feature_desirability()
         if not subset:
             return float("-inf")
 
@@ -1403,71 +1596,75 @@ class FLAVORS2:
         size_penalty = 0.01 * len(subset) / max(1, self.n_feats)
         return avg_value - size_penalty
 
-    def _generate_candidate_batch(self, current_subset, batch_size, step_size, remaining_budget_fraction):
-        pool_size = max(batch_size, self.candidate_pool_size)
-        candidates = []
-        priority_keys = set()
+    def _proposal_target(self, strategy, current_subset, step_size):
+        current_size = max(1, len(current_subset))
+        if strategy in {"global", "ranked"}:
+            return self._choose_size_exploration_target(current_subset, step_size)
+        jumps = [-2, -1, 0, 1, 2] if strategy == "uncertain" else [-1, 0, 1]
+        jump = int(self._rng.choice(jumps)) * max(1, int(step_size))
+        return max(1, min(self.n_feats, current_size + jump))
 
-        leaderboard_subsets = [list(subset) for _, subset in self.leaderboard[:min(5, len(self.leaderboard))]]
-        bases = [list(current_subset)] + leaderboard_subsets
-        coverage_candidate_probability = getattr(self, "_coverage_candidate_probability", 0.0)
+    def _propose_candidate(self, strategy, current_subset, step_size):
+        target = self._proposal_target(strategy, current_subset, step_size)
+        if strategy == "ranked":
+            return self._ranked_candidate(target)
+        if strategy == "uncertain":
+            return self._uncertain_candidate(target)
+        if strategy == "global":
+            return self._random_weighted_subset(target)
+
+        bases = [list(current_subset)] + self._diverse_elite_subsets(limit=8)
+        base = bases[int(self._rng.randint(0, len(bases)))]
+        target = max(
+            1,
+            min(
+                self.n_feats,
+                len(base) + int(self._rng.choice([-1, 0, 1])) * max(1, int(step_size)),
+            ),
+        )
+        return self._mutate_subset(base, target, step_size)
+
+    def _generate_candidate_batch(self, current_subset, batch_size, step_size, remaining_budget_fraction):
+        batch_size = max(1, int(batch_size))
+        candidates_per_slot = max(3, self.candidate_pool_size // batch_size)
+        names, probabilities = self._proposal_probabilities(remaining_budget_fraction)
+        selected = []
+        selected_keys = set()
         size_exploration_probability = self._size_exploration_probability(remaining_budget_fraction)
 
-        if self._rng.rand() < size_exploration_probability:
-            target = self._choose_size_exploration_target(current_subset, step_size)
-            candidate = self._random_weighted_subset(target)
-            key = self._normalize_subset_key(candidate)
-            candidates.append(candidate)
-            priority_keys.add(key)
+        for _ in range(batch_size):
+            strategy = str(self._rng.choice(names, p=probabilities))
+            if self._rng.rand() < size_exploration_probability:
+                strategy = str(self._rng.choice(("global", "ranked")))
 
-        for _ in range(pool_size):
-            if self.unevaluated and self._rng.rand() < coverage_candidate_probability:
-                jumps = [-2, -1, 1, 2] if remaining_budget_fraction > 0.2 else [-1, 0, 1]
-                target = max(1, min(self.n_feats, len(current_subset) + int(self._rng.choice(jumps) * max(1, step_size))))
-                candidate = self._random_weighted_subset(target)
-            elif bases and self._rng.rand() > max(0.15, remaining_budget_fraction * 0.25):
-                base = bases[int(self._rng.randint(0, len(bases)))]
-                target = max(1, min(self.n_feats, len(base) + int(self._rng.choice([-1, 0, 1]) * max(1, step_size))))
-                candidate = self._mutate_subset(base, target, step_size)
-            else:
-                target = max(1, min(self.n_feats, len(current_subset) + int(self._rng.choice([-2, -1, 1, 2]) * max(1, step_size))))
-                candidate = self._random_weighted_subset(target)
-            candidates.append(candidate)
-
-        unique = {}
-        for candidate in candidates:
-            key = self._normalize_subset_key(candidate)
-            if key not in unique:
-                unique[key] = list(key)
-
-        ranked_all = sorted(unique.values(), key=self._candidate_score, reverse=True)
-        priority_ranked = [
-            candidate for candidate in ranked_all
-            if self._normalize_subset_key(candidate) in priority_keys
-            and self._normalize_subset_key(candidate) not in self._score_cache
-        ]
-        regular_ranked = [
-            candidate for candidate in ranked_all
-            if self._normalize_subset_key(candidate) not in priority_keys
-            and self._normalize_subset_key(candidate) not in self._score_cache
-        ]
-        ranked = priority_ranked + regular_ranked
-        if len(ranked) < batch_size:
-            attempts = 0
-            while len(ranked) < batch_size and attempts < pool_size * 4:
-                if self._rng.rand() < size_exploration_probability:
-                    target = self._choose_size_exploration_target(current_subset, step_size)
-                else:
-                    jumps = [-2, -1, 0, 1, 2] if self.unevaluated else [-1, 0, 1]
-                    target = max(1, min(self.n_feats, len(current_subset) + int(self._rng.choice(jumps) * max(1, step_size))))
-                candidate = self._random_weighted_subset(target)
+            pool = []
+            for _ in range(candidates_per_slot):
+                candidate = self._propose_candidate(strategy, current_subset, step_size)
                 key = self._normalize_subset_key(candidate)
-                if key not in unique and key not in self._score_cache:
-                    unique[key] = list(key)
-                    ranked.append(list(key))
-                attempts += 1
+                if key in self._score_cache or key in selected_keys:
+                    continue
+                pool.append(list(key))
 
-        return ranked[:batch_size]
+            if not pool:
+                continue
+            candidate = max(pool, key=self._candidate_score)
+            key = self._normalize_subset_key(candidate)
+            selected.append(candidate)
+            selected_keys.add(key)
+            self._candidate_strategies[key] = strategy
+
+        attempts = 0
+        while len(selected) < batch_size and attempts < self.candidate_pool_size * 4:
+            strategy = str(self._rng.choice(names, p=probabilities))
+            candidate = self._propose_candidate(strategy, current_subset, step_size)
+            key = self._normalize_subset_key(candidate)
+            if key not in self._score_cache and key not in selected_keys:
+                selected.append(list(key))
+                selected_keys.add(key)
+                self._candidate_strategies[key] = strategy
+            attempts += 1
+
+        return selected
 
 
     def select_best_feature_subset(self, budget):
@@ -1485,7 +1682,7 @@ class FLAVORS2:
 
         # Initial subset size heuristic
         if not hasattr(self, 'num_features') or not self.fitted:
-            self.num_features = max(1, min(int(np.sqrt(self.n_feats)), self.n_feats // 2, 10)) # Start small/medium
+            self.num_features = self._initial_subset_size()
 
         # Generate and evaluate initial subset
         self._set_coverage_pressure(1.0, force=True)
@@ -1784,6 +1981,13 @@ class FLAVORS2:
             self.loop_results_ = 0
             self._size_eval_counts = defaultdict(int)
             self._size_best_errors = {}
+            self._size_error_history = defaultdict(list)
+            self._elite_candidates = {}
+            self._candidate_strategies = {}
+            self._proposal_stats = {
+                name: {"trials": 0, "improvement": 0.0, "cost": 0.0}
+                for name in ("local", "global", "ranked", "uncertain")
+            }
             # Reset performance/stability tracking
             self.feature_performance = np.zeros(self.n_feats)
             self.feature_counts = np.zeros(self.n_feats)
@@ -1835,6 +2039,8 @@ class FLAVORS2:
         # --- Run the main search ---
         elapsed_before_search = (datetime.datetime.now() - fit_start_time).total_seconds()
         search_budget = max(0.0, float(self.budget) - elapsed_before_search)
+        if self.strict_budget and search_budget < 0.05:
+            self.budget_exhausted_ = True
         print(f"Starting feature selection search with budget: {search_budget:.6f} seconds...")
         try:
             if search_budget >= 0.05:
