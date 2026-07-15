@@ -36,3 +36,5 @@ def test_initial_fallback_uses_twice_square_root_feature_count():
     selector.fit(X, y)
 
     assert len(selector.selected_indices_) == 20
+    assert isinstance(selector.strategy_eci_, dict)
+    assert isinstance(selector.eci_history_, list)

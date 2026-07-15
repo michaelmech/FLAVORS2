@@ -14,6 +14,7 @@ import datetime
 import os
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, wait
+from contextlib import nullcontext
 from heapq import heappop, heappush
 from functools import wraps
 import inspect
@@ -178,12 +179,15 @@ class FLAVORS2:
         self._size_eval_counts = defaultdict(int)
         self._size_best_errors = {}
         self._size_error_history = defaultdict(list)
+        self._size_cost_history = defaultdict(list)
         self._elite_candidates = {}
         self._candidate_strategies = {}
-        self._proposal_stats = {
-            name: {"trials": 0, "improvement": 0.0, "cost": 0.0}
-            for name in ("local", "global", "ranked", "uncertain")
-        }
+        self._candidate_eci_estimates = {}
+        self._proposal_stats = self._empty_proposal_stats()
+        self.eci_history_ = []
+        self.strategy_eci_ = {}
+        self.eci_cost_growth = 2.0
+        self.eci_exploration_fraction = 0.20
         self._evaluation_executor = None
         self.timed_out_evaluations_ = 0
         self.budget_exhausted_ = False
@@ -206,6 +210,20 @@ class FLAVORS2:
         self.metrics = metrics
         if len(metrics) == 1:
             self.metric = metrics[0]
+
+    @staticmethod
+    def _empty_proposal_stats():
+        return {
+            name: {
+                "trials": 0,
+                "improvement": 0.0,
+                "cost": 0.0,
+                "last_cost": 0.0,
+                "best_error": float("inf"),
+                "improvements": [],
+            }
+            for name in ("local", "global", "ranked", "uncertain")
+        }
 
 
     def update_pareto_history(self, new_tuple):
@@ -540,54 +558,69 @@ class FLAVORS2:
 
 
     def initial_ECI(self, feat):
-        # ECI: Estimated Cost per unit of Improvement (lower is better)
-        # This estimates cost impact of adding the feature to an empty set.
-        # Improvement estimate could be added here (e.g., using feature_priors)
+        """Return the prior cost per unit of improvement for one feature."""
         est_cost = self.estimate_feature_cost_impact([], feat)
-        # Placeholder for improvement (e.g., mutual info score)
         est_improvement = self.feature_priors[feat] if hasattr(self, 'feature_priors') and feat < len(self.feature_priors) else 1e-3
-        # Avoid division by zero
         return est_cost / max(1e-9, est_improvement)
 
+    @staticmethod
+    def _calculate_eci(
+        total_cost,
+        latest_improvement_cost,
+        previous_improvement_cost,
+        improvement_delta,
+        candidate_best_error,
+        global_best_error,
+        last_trial_cost,
+        cost_growth=2.0,
+    ):
+        """Estimate the cost required for a search sequence to improve globally.
+
+        This is the FLAML ECI construction adapted to the selector's universal
+        lower-is-better error representation. K0 is total sequence cost, while
+        K1 and K2 are cumulative costs at its two latest improvements.
+        """
+        epsilon = 1e-9
+        K0 = max(epsilon, float(total_cost))
+        K1 = min(K0, max(0.0, float(latest_improvement_cost)))
+        K2 = min(K1, max(0.0, float(previous_improvement_cost)))
+        last_cost = max(epsilon, float(last_trial_cost))
+        growth = max(1.0, float(cost_growth))
+
+        eci1 = max(K0 - K1, K1 - K2, epsilon)
+        eci2 = growth * last_cost
+        direct_improvement_cost = min(eci1, eci2)
+
+        if not np.isfinite(global_best_error) or not np.isfinite(candidate_best_error):
+            return max(epsilon, direct_improvement_cost)
+
+        error_gap = max(0.0, float(candidate_best_error - global_best_error))
+        if error_gap <= epsilon:
+            return max(epsilon, direct_improvement_cost)
+
+        delta = max(epsilon, abs(float(improvement_delta)))
+        cost_for_observed_improvement = max(last_cost, K0 - K2)
+        catch_up_cost = growth * error_gap * cost_for_observed_improvement / delta
+        return max(epsilon, direct_improvement_cost, catch_up_cost)
 
     def calculate_ECI(self, K0, K1, K2, delta, best_error, feature_error, tau):
-         # This seems like a custom ECI calculation, maybe related to FLAML's CFEI/CS.
-         # K0, K1, K2 likely relate to scores/errors of related configurations.
-         # delta: change in score/error
-         # best_error: current best error
-         # feature_error: error with the feature change
-         # tau: iteration count or time?
-         # self.c, self.kl: exploration/cost parameters
+        """Backward-compatible entry point for the active ECI calculation.
 
-         # Ensure inputs are valid
-         delta = max(abs(delta), 1e-9) # Avoid division by zero
-         time_cost = self.kl if hasattr(self, 'kl') and self.kl > 0 else 1e-3
-
-         # Error gain (or loss if minimizing and feature_error is higher)
-         error_diff = feature_error - best_error # Assumes lower error is better
-         if self.minimize:
-             error_diff = -error_diff # Adjust if minimizing
-
-         # Improvement part of ECI (higher is better)
-         improvement_term = error_diff * tau / delta
-
-         # Exploration/Uncertainty part (related to score variance/range)
-         exploration_term1 = max(abs(K0 - K1), abs(K1 - K2)) # Score difference/range
-         # Exploration related to cost/time?
-         exploration_term2 = self.c * time_cost if hasattr(self, 'c') else 1.0 * time_cost
-
-         # Combine terms - this logic needs clarification based on the source algorithm
-         # If feature_error is the same as best_error, use exploration term only?
-         if abs(feature_error - best_error) < 1e-9:
-             eci = min(exploration_term1, exploration_term2)
-         else:
-             # Combine improvement and exploration - MAX suggests taking the more promising signal?
-             eci = max(improvement_term, min(exploration_term1, exploration_term2))
-
-         # ECI typically measures Cost / Improvement, so lower is better.
-         # The calculation above seems to yield a value where higher might be better? Recheck formula.
-         # Assuming higher value from calc means "more promising", return it.
-         return eci
+        Lower values are better. ``tau`` is the latest observed trial cost.
+        """
+        return self._calculate_eci(
+            total_cost=K0,
+            latest_improvement_cost=K1,
+            previous_improvement_cost=K2,
+            improvement_delta=delta,
+            candidate_best_error=feature_error,
+            global_best_error=best_error,
+            last_trial_cost=tau,
+            cost_growth=min(
+                self.eci_cost_growth,
+                max(1.0, float(getattr(self, "c", self.eci_cost_growth))),
+            ),
+        )
 
     @staticmethod
     def _compute_subset_score(subset, X, y, sample_weight, metrics, minimize, n_feats):
@@ -894,8 +927,9 @@ class FLAVORS2:
         if remaining < required_time:
             return 0
 
-        if self.n_jobs > 1:
-            return max(1, min(int(self.n_jobs), int(remaining // required_time)))
+        worker_count = self._worker_count()
+        if worker_count > 1:
+            return max(1, min(worker_count, int(remaining // required_time)))
         return 1
 
     def _budget_limited_batch(self, candidates, deadline):
@@ -1040,7 +1074,7 @@ class FLAVORS2:
                     result["cache_hit"] = False
                     self._score_cache[key] = result
                     results_by_key[key] = result
-            elif self.n_jobs > 1 and len(missing_keys) > 1:
+            elif self._worker_count() > 1 and len(missing_keys) > 1:
                 parallel = Parallel(n_jobs=self.n_jobs)
                 computed = parallel(delayed(self._compute_subset_score)(
                     list(key), self.X, self.y, self.sample_weight, self.metrics, self.minimize, self.n_feats
@@ -1142,12 +1176,17 @@ class FLAVORS2:
           self._size_best_errors = {}
       if not hasattr(self, "_size_error_history"):
           self._size_error_history = defaultdict(list)
+      if not hasattr(self, "_size_cost_history"):
+          self._size_cost_history = defaultdict(list)
       self._size_eval_counts[subset_size] += 1
       previous_size_best = self._size_best_errors.get(subset_size, float('inf'))
       prior_size_errors = list(self._size_error_history[subset_size])
       subset_quality = self._subset_quality(self.current_error, prior_size_errors)
       self._size_best_errors[subset_size] = min(previous_size_best, self.current_error)
       self._size_error_history[subset_size].append(self.current_error)
+      if np.isfinite(eval_time) and eval_time > 0:
+          self._size_cost_history[subset_size].append(float(eval_time))
+          self._size_cost_history[subset_size] = self._size_cost_history[subset_size][-20:]
       self._record_elite_candidate(subset, self.current_error)
       self._record_proposal_result(subset_key, self.current_error, previous_size_best, eval_time)
 
@@ -1260,11 +1299,7 @@ class FLAVORS2:
             self.update_feature_stability()
 
 
-        # Update exploration parameters (self.c, self.kl) - based on FLAML/related algorithms?
-        # self.kl often relates to cost or time
-        self.kl = max(1e-9, time_cost) # Use current evaluation time/cost
-
-        # self.c balances exploration/exploitation, might depend on subset size
+        # Adapt the ECI cost-growth bound to the current subset scale.
         current_subset_size = len(current_subset) if current_subset else 1
         # Ensure c_sub and n_feats are valid
         c_sub = self.c_sub if hasattr(self, 'c_sub') else 4
@@ -1393,7 +1428,9 @@ class FLAVORS2:
             return
         stats = self._proposal_stats[strategy]
         stats["trials"] += 1
-        stats["cost"] += max(0.0, float(eval_time))
+        trial_cost = max(1e-9, float(eval_time))
+        stats["cost"] += trial_cost
+        stats["last_cost"] = trial_cost
 
         size_improvement = 0.0
         if np.isfinite(previous_size_best):
@@ -1403,24 +1440,98 @@ class FLAVORS2:
             global_improvement = max(0.0, float(self.best_error - error))
         stats["improvement"] += global_improvement + 0.2 * size_improvement
 
+        if np.isfinite(error) and error < stats["best_error"]:
+            stats["best_error"] = float(error)
+            stats["improvements"].append((float(stats["cost"]), float(error)))
+            stats["improvements"] = stats["improvements"][-3:]
+
+        candidate_eci = getattr(self, "_candidate_eci_estimates", {}).pop(subset_key, None)
+        strategy_eci = self._strategy_eci(strategy)
+        self.eci_history_.append(
+            {
+                "strategy": strategy,
+                "subset": tuple(subset_key),
+                "candidate_eci": candidate_eci,
+                "strategy_eci": strategy_eci,
+                "error": float(error),
+                "cost": trial_cost,
+            }
+        )
+
+    def _observed_error_scale(self):
+        finite = np.asarray(
+            [error for error in getattr(self, "performance_history", []) if np.isfinite(error)],
+            dtype=float,
+        )
+        if finite.size >= 2:
+            scale = float(np.percentile(finite, 90) - np.percentile(finite, 10))
+            if scale > 1e-9:
+                return scale
+        return 1.0
+
+    def _strategy_eci(self, strategy):
+        """Return FLAML-style ECI for one proposal sequence."""
+        stats = self._proposal_stats[strategy]
+        if stats["trials"] <= 0 or stats["cost"] <= 0:
+            eci = self._estimated_eval_time()
+            self.strategy_eci_[strategy] = eci
+            return eci
+
+        improvements = stats["improvements"]
+        if len(improvements) >= 2:
+            K1, latest_error = improvements[-1]
+            K2, previous_error = improvements[-2]
+            delta = max(1e-9, float(previous_error - latest_error))
+        elif improvements:
+            K1, latest_error = improvements[-1]
+            K2 = 0.0
+            delta = self._observed_error_scale()
+        else:
+            K1 = 0.0
+            K2 = 0.0
+            latest_error = stats["best_error"]
+            delta = self._observed_error_scale()
+
+        eci = self.calculate_ECI(
+            stats["cost"],
+            K1,
+            K2,
+            delta,
+            getattr(self, "best_error", float("inf")),
+            latest_error,
+            stats["last_cost"],
+        )
+        self.strategy_eci_[strategy] = eci
+        return eci
+
     def _proposal_probabilities(self, remaining_budget_fraction=1.0):
         names = ("local", "global", "ranked", "uncertain")
-        base = np.asarray([0.30, 0.22, 0.33, 0.15], dtype=float)
         remaining = max(0.0, min(1.0, float(remaining_budget_fraction)))
-        base[0] += 0.15 * (1.0 - remaining)
-        base[1] *= 0.6 + 0.4 * remaining
-        base[3] *= 0.7 + 0.3 * remaining
-        efficiencies = np.asarray([
-            self._proposal_stats[name]["improvement"]
-            / max(self._proposal_stats[name]["cost"], 1e-9)
-            for name in names
-        ])
-        maximum = float(np.max(efficiencies)) if efficiencies.size else 0.0
-        normalized_efficiency = efficiencies / maximum if maximum > 0 else efficiencies
-        trials = np.asarray([self._proposal_stats[name]["trials"] for name in names], dtype=float)
-        exploration = 1.0 / np.sqrt(trials + 1.0)
-        weights = base * (1.0 + 0.75 * normalized_efficiency) + 0.08 * exploration
-        return names, weights / np.sum(weights)
+        eci = np.asarray([self._strategy_eci(name) for name in names], dtype=float)
+        inverse_eci = 1.0 / np.maximum(eci, 1e-9)
+
+        # ECI remains the primary allocator. Small phase modifiers express the
+        # direct-search schedule without overpowering observed cost efficiency.
+        phase = np.asarray(
+            [
+                1.0 + 0.25 * (1.0 - remaining),
+                0.9 + 0.20 * remaining,
+                1.10,
+                0.9 + 0.15 * remaining,
+            ],
+            dtype=float,
+        )
+        eci_probabilities = inverse_eci * phase
+        eci_probabilities /= np.sum(eci_probabilities)
+
+        # FLAML's FairChance property is explicit here: every proposal
+        # sequence retains a fixed share of the budget even if its ECI is poor.
+        fair_chance = max(0.0, min(0.5, float(self.eci_exploration_fraction)))
+        probabilities = (
+            (1.0 - fair_chance) * eci_probabilities
+            + fair_chance / len(names)
+        )
+        return names, probabilities / np.sum(probabilities)
 
     def _ranked_candidate(self, n_target_feats):
         """Sample near the learned ranking without creating an irreversible path."""
@@ -1472,6 +1583,19 @@ class FLAVORS2:
         # feature has been observed. This uses expensive evidence immediately
         # without allowing one evaluation to dominate the search.
         base_weights = self._feature_desirability()
+
+        # The first proposal is organized by per-feature prior ECI. Once
+        # evidence arrives, the reliability-weighted desirability model takes
+        # over while retaining the same cost-sensitive sampling path.
+        if np.sum(self.feature_counts) == 0:
+            initial_eci = np.asarray(
+                [self.initial_ECI(feat) for feat in range(self.n_feats)],
+                dtype=float,
+            )
+            initial_inverse = 1.0 / np.maximum(initial_eci, 1e-9)
+            maximum_inverse = float(np.max(initial_inverse)) if initial_inverse.size else 0.0
+            if maximum_inverse > 0:
+                base_weights = 0.5 * base_weights + 0.5 * (initial_inverse / maximum_inverse)
 
         # Factor in feature cost (lower cost = higher weight).
         if hasattr(self, 'feature_cost_history') and self.feature_cost_history:
@@ -1583,18 +1707,150 @@ class FLAVORS2:
 
         return sorted(current)
 
-    def _candidate_score(self, subset):
+    def _estimate_candidate_cost(self, subset):
+        """Predict evaluation cost from subset size and learned feature costs."""
         subset = self._normalize_subset_key(subset)
-        if subset in self._score_cache:
-            return float("-inf")
+        if not subset:
+            return float("inf")
+
+        size = len(subset)
+        histories = getattr(self, "_size_cost_history", {})
+        exact_costs = [cost for cost in histories.get(size, []) if np.isfinite(cost) and cost > 0]
+        if exact_costs:
+            size_cost = float(np.median(exact_costs))
+        else:
+            observed = [
+                (observed_size, float(np.median(costs)))
+                for observed_size, costs in histories.items()
+                if observed_size > 0
+                and any(np.isfinite(cost) and cost > 0 for cost in costs)
+            ]
+            if observed:
+                observed_size, observed_cost = min(
+                    observed,
+                    key=lambda item: abs(item[0] - size),
+                )
+                size_ratio = size / max(1, observed_size)
+                size_cost = observed_cost * (size_ratio ** 0.75)
+            else:
+                base_cost = self._estimated_eval_time()
+                reference_size = max(1, getattr(self, "num_features", size))
+                size_cost = base_cost * ((size / reference_size) ** 0.75)
+
+        feature_costs = np.asarray(
+            [self.feature_cost_history.get(feat, 1.0) for feat in subset],
+            dtype=float,
+        )
+        feature_costs = np.clip(
+            np.nan_to_num(feature_costs, nan=1.0, posinf=10.0, neginf=0.1),
+            0.1,
+            10.0,
+        )
+        feature_factor = 0.75 + 0.25 * np.sqrt(float(np.mean(feature_costs)))
+        return max(1e-9, float(size_cost) * feature_factor)
+
+    def _candidate_improvement_potential(self, subset, reference_subset=None):
+        """Estimate direction-free improvement potential for an unseen subset."""
+        subset = self._normalize_subset_key(subset)
+        if not subset:
+            return 1e-9
 
         values = self._feature_desirability()
-        if not subset:
-            return float("-inf")
+        minimum = float(np.min(values)) if values.size else 0.0
+        maximum = float(np.max(values)) if values.size else 0.0
+        if maximum - minimum > 1e-9:
+            normalized_values = (values - minimum) / (maximum - minimum)
+        else:
+            normalized_values = np.full(self.n_feats, 0.5, dtype=float)
 
-        avg_value = float(np.mean(values[list(subset)]))
-        size_penalty = 0.01 * len(subset) / max(1, self.n_feats)
-        return avg_value - size_penalty
+        quality = float(np.mean(normalized_values[list(subset)]))
+        reference = self._normalize_subset_key(reference_subset or [])
+        reference_quality = (
+            float(np.mean(normalized_values[list(reference)]))
+            if reference
+            else float(np.mean(normalized_values))
+        )
+        quality_gain = max(0.0, quality - reference_quality)
+
+        counts = np.asarray(self.feature_counts, dtype=float)
+        feature_uncertainty = float(np.mean(1.0 / np.sqrt(counts[list(subset)] + 1.0)))
+        size_uncertainty = 1.0 / np.sqrt(self._size_eval_counts.get(len(subset), 0) + 1.0)
+
+        finite_size_bests = {
+            size: error
+            for size, error in self._size_best_errors.items()
+            if np.isfinite(error)
+        }
+        if len(subset) in finite_size_bests:
+            candidate_size_error = finite_size_bests[len(subset)]
+            size_promise = (
+                sum(error >= candidate_size_error for error in finite_size_bests.values()) + 0.5
+            ) / (len(finite_size_bests) + 1.0)
+        else:
+            size_promise = 0.65
+
+        elites = getattr(self, "_elite_candidates", {})
+        if elites:
+            subset_set = set(subset)
+            maximum_overlap = max(
+                len(subset_set & set(elite)) / max(1, len(subset_set | set(elite)))
+                for elite in elites
+            )
+            novelty = 1.0 - maximum_overlap
+        else:
+            novelty = 1.0
+
+        potential = (
+            0.05
+            + 0.30 * quality
+            + 0.25 * quality_gain
+            + 0.15 * feature_uncertainty
+            + 0.10 * size_uncertainty
+            + 0.10 * novelty
+            + 0.05 * size_promise
+        )
+        return max(1e-9, float(potential))
+
+    def _candidate_eci(self, subset, reference_subset=None):
+        """Estimate cost required for an unseen subset to yield improvement."""
+        subset = self._normalize_subset_key(subset)
+        if not subset or subset in self._score_cache:
+            return float("inf")
+        estimated_cost = self._estimate_candidate_cost(subset)
+        improvement_potential = self._candidate_improvement_potential(
+            subset,
+            reference_subset=reference_subset,
+        )
+        return estimated_cost / max(1e-9, improvement_potential)
+
+    def _candidate_score(self, subset, reference_subset=None):
+        """Compatibility score whose ordering is exactly inverse candidate ECI."""
+        eci = self._candidate_eci(subset, reference_subset=reference_subset)
+        return -eci if np.isfinite(eci) else float("-inf")
+
+    def _select_candidate_by_eci(self, pool, reference_subset=None):
+        """Sample a candidate by inverse ECI while retaining fair chance."""
+        if not pool:
+            return None
+
+        ecis = np.asarray(
+            [self._candidate_eci(candidate, reference_subset=reference_subset) for candidate in pool],
+            dtype=float,
+        )
+        finite = np.isfinite(ecis) & (ecis > 0)
+        if not np.any(finite):
+            return list(pool[int(self._rng.randint(0, len(pool)))])
+
+        inverse = np.zeros(len(pool), dtype=float)
+        # Candidate estimates are short-lived comparisons inside one proposal
+        # family. Sharpen inverse ECI so a tiny budget is unlikely to be spent
+        # on a visibly weaker pool member, while keeping the choice stochastic.
+        inverse[finite] = (1.0 / ecis[finite]) ** 2
+        inverse /= np.sum(inverse)
+        fair_chance = 0.05
+        probabilities = (1.0 - fair_chance) * inverse + fair_chance / len(pool)
+        index = int(self._rng.choice(len(pool), p=probabilities / np.sum(probabilities)))
+        return list(pool[index])
 
     def _proposal_target(self, strategy, current_subset, step_size):
         current_size = max(1, len(current_subset))
@@ -1637,21 +1893,28 @@ class FLAVORS2:
             if self._rng.rand() < size_exploration_probability:
                 strategy = str(self._rng.choice(("global", "ranked")))
 
-            pool = []
+            pool = {}
             for _ in range(candidates_per_slot):
                 candidate = self._propose_candidate(strategy, current_subset, step_size)
                 key = self._normalize_subset_key(candidate)
                 if key in self._score_cache or key in selected_keys:
                     continue
-                pool.append(list(key))
+                pool[key] = list(key)
 
             if not pool:
                 continue
-            candidate = max(pool, key=self._candidate_score)
+            candidate = self._select_candidate_by_eci(
+                list(pool.values()),
+                reference_subset=current_subset,
+            )
             key = self._normalize_subset_key(candidate)
             selected.append(candidate)
             selected_keys.add(key)
             self._candidate_strategies[key] = strategy
+            self._candidate_eci_estimates[key] = self._candidate_eci(
+                key,
+                reference_subset=current_subset,
+            )
 
         attempts = 0
         while len(selected) < batch_size and attempts < self.candidate_pool_size * 4:
@@ -1662,6 +1925,10 @@ class FLAVORS2:
                 selected.append(list(key))
                 selected_keys.add(key)
                 self._candidate_strategies[key] = strategy
+                self._candidate_eci_estimates[key] = self._candidate_eci(
+                    key,
+                    reference_subset=current_subset,
+                )
             attempts += 1
 
         return selected
@@ -1687,6 +1954,9 @@ class FLAVORS2:
         # Generate and evaluate initial subset
         self._set_coverage_pressure(1.0, force=True)
         current_subset = self.search_strategy(self.num_features)
+        initial_key = self._normalize_subset_key(current_subset)
+        self._candidate_strategies[initial_key] = "global"
+        self._candidate_eci_estimates[initial_key] = self._candidate_eci(initial_key)
         if self._fresh_eval_capacity(end_time) <= 0:
             fallback_subset = self._fallback_subset_from_priors()
             self.leaderboard.append((float('inf'), fallback_subset))
@@ -1706,10 +1976,10 @@ class FLAVORS2:
             self.iters_best = 0 # Initialize best iteration tracker
 
         no_improvement_counter = 0
-        batch_size = max(1, self.n_jobs)
+        batch_size = self._worker_count()
 
         # Main search loop
-        with parallel_backend('loky'):
+        with (parallel_backend('loky') if self._worker_count() > 1 else nullcontext()):
             while datetime.datetime.now() < main_search_end:
                 remaining_time = (main_search_end - datetime.datetime.now()).total_seconds()
                 if remaining_time <= 0:
@@ -1769,6 +2039,11 @@ class FLAVORS2:
                     # Generate and evaluate restart subset
                     current_subset = self.search_strategy(restart_features)
                     self.num_features = len(current_subset)
+                    restart_key = self._normalize_subset_key(current_subset)
+                    self._candidate_strategies[restart_key] = "global"
+                    self._candidate_eci_estimates[restart_key] = self._candidate_eci(
+                        restart_key
+                    )
                     if self._fresh_eval_capacity(main_search_end) <= 0:
                         break
                     result = self._evaluate_batch([current_subset], deadline=main_search_end)[0]
@@ -1779,7 +2054,7 @@ class FLAVORS2:
         min_refinement_duration = min(refinement_duration, max(0.0, budget * 0.03))
         coverage_target = self._coverage_target(budget)
         coverage_catchup_end = end_time - datetime.timedelta(seconds=min_refinement_duration)
-        with parallel_backend('loky'):
+        with (parallel_backend('loky') if self._worker_count() > 1 else nullcontext()):
             while datetime.datetime.now() < coverage_catchup_end and self._coverage_ratio() < coverage_target:
                 remaining_time = (coverage_catchup_end - datetime.datetime.now()).total_seconds()
                 if remaining_time <= 0:
@@ -1821,7 +2096,7 @@ class FLAVORS2:
         # --- Refinement Phase ---
         # Focus search around the best solution found so far using local moves
         refine_start_time = datetime.datetime.now()
-        with parallel_backend('loky'):
+        with (parallel_backend('loky') if self._worker_count() > 1 else nullcontext()):
             while datetime.datetime.now() < end_time:
                  if not self.leaderboard:
                      break # Exit if no solution found
@@ -1842,7 +2117,8 @@ class FLAVORS2:
 
                  # Generate batch of refinement actions
                  batch_subsets_refine = []
-                 for _ in range(batch_size):
+                 refinement_pool_size = max(batch_size, self.candidate_pool_size)
+                 for _ in range(refinement_pool_size):
                      action = self._rng.choice(['add', 'remove', 'swap'])
 
                      new_subset_refine = None
@@ -1884,7 +2160,22 @@ class FLAVORS2:
                  if not fresh_refine:
                      break
 
-                 batch_subsets_refine = fresh_refine[:batch_size]
+                 selected_refine = []
+                 while fresh_refine and len(selected_refine) < batch_size:
+                     candidate = self._select_candidate_by_eci(
+                         fresh_refine,
+                         reference_subset=best_subset_refine,
+                     )
+                     selected_refine.append(candidate)
+                     fresh_refine.remove(candidate)
+                     key = self._normalize_subset_key(candidate)
+                     self._candidate_strategies[key] = "local"
+                     self._candidate_eci_estimates[key] = self._candidate_eci(
+                         key,
+                         reference_subset=best_subset_refine,
+                     )
+
+                 batch_subsets_refine = selected_refine
                  batch_subsets_refine = self._budget_limited_batch(batch_subsets_refine, end_time)
                  if not batch_subsets_refine:
                      break
@@ -1982,12 +2273,13 @@ class FLAVORS2:
             self._size_eval_counts = defaultdict(int)
             self._size_best_errors = {}
             self._size_error_history = defaultdict(list)
+            self._size_cost_history = defaultdict(list)
             self._elite_candidates = {}
             self._candidate_strategies = {}
-            self._proposal_stats = {
-                name: {"trials": 0, "improvement": 0.0, "cost": 0.0}
-                for name in ("local", "global", "ranked", "uncertain")
-            }
+            self._candidate_eci_estimates = {}
+            self._proposal_stats = self._empty_proposal_stats()
+            self.eci_history_ = []
+            self.strategy_eci_ = {}
             # Reset performance/stability tracking
             self.feature_performance = np.zeros(self.n_feats)
             self.feature_counts = np.zeros(self.n_feats)
@@ -2001,7 +2293,6 @@ class FLAVORS2:
             self.error_marker = None # Stores actual metric value(s)
 
             # Initialize counters and parameters
-            self.kl = 1e-3 # Initial small cost estimate
             self.c = self.c_sub
             self.placeholder_coefficient = float('inf') # Tracks min eval time
             self.iters = 0
@@ -2126,6 +2417,8 @@ class FLAVORS2FeatureSelector(BaseEstimator, TransformerMixin):
         self.selected_indices = None
         self.n_features_in_ = None
         self.feature_names_in_ = None
+        self.strategy_eci_ = None
+        self.eci_history_ = None
         self._sample_weight = None
 
     def fit(self, X, y=None, sample_weight=None):
@@ -2159,6 +2452,8 @@ class FLAVORS2FeatureSelector(BaseEstimator, TransformerMixin):
 
         # Back-compat alias (your older code referenced this)
         self.selected_indices = self.selected_indices_
+        self.strategy_eci_ = dict(self.selector.strategy_eci_)
+        self.eci_history_ = list(self.selector.eci_history_)
 
         # (Optional) quick telemetry
         if hasattr(self.selector, "feature_counts"):

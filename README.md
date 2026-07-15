@@ -172,7 +172,14 @@ selector = FLAVORS2FeatureSelector(
 ### Cost-Frugal Stochastic Search
 
 FLAVORS2 allocates its evaluation budget across local mutation, global size exploration, soft importance-ranked sampling, and uncertainty sampling.
-The allocation adapts to the score improvement produced per second by each proposal strategy.
+Estimated Cost for Improvement (ECI) is the organizing principle for that allocation.
+Each proposal strategy tracks cumulative evaluation cost, the costs at its latest improvements, and the error reduction between those improvements.
+Strategies with lower estimated cost to produce the next improvement receive more trials through inverse-ECI sampling.
+Every strategy retains a fixed fair-chance probability because ECI estimates are uncertain and global exploration must remain reachable.
+
+Before evaluation, each proposed subset also receives a candidate ECI based on predicted evaluation cost, learned feature evidence, uncertainty, subset-size evidence, and novelty.
+Candidate selection uses inverse-ECI sampling instead of a deterministic ranking.
+The fitted selector exposes `strategy_eci_` and `eci_history_` for diagnostics.
 It also maintains a diverse population of strong subsets so local proposals are not restricted to one greedy trajectory.
 
 Importance-ranked proposals remain stochastic and do not permanently eliminate features.
