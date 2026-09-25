@@ -19,12 +19,10 @@ import inspect
 
 # Scikit-learn
 from sklearn.utils import check_array
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
-from sklearn.base import BaseEstimator, TransformerMixin, clone
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import RobustScaler
+from sklearn.base import BaseEstimator, TransformerMixin
 
 
 # Joblib
@@ -178,7 +176,6 @@ class FLAVORS2:
         # This calculates sum of areas/volumes relative to origin, which isn't standard hypervolume.
         # Consider using a dedicated library (e.g., pygmo) if precise HV is needed.
         hypervolume = 0.0
-        last_point = ref_point
         for i in range(n):
              # This part is conceptually incorrect for standard hypervolume.
              # It's summing individual point contributions without proper slicing.
@@ -405,9 +402,12 @@ class FLAVORS2:
         removed_features = prev_set - new_set
 
         # Initialize history tracking if first time
-        if not hasattr(self, 'feature_addition_times'): self.feature_addition_times = {}
-        if not hasattr(self, 'feature_removal_times'): self.feature_removal_times = {}
-        if not hasattr(self, 'feature_cost_history'): self.feature_cost_history = {}
+        if not hasattr(self, 'feature_addition_times'):
+            self.feature_addition_times = {}
+        if not hasattr(self, 'feature_removal_times'):
+            self.feature_removal_times = {}
+        if not hasattr(self, 'feature_cost_history'):
+            self.feature_cost_history = {}
 
         for feat in added_features:
             if feat not in self.feature_addition_times:
@@ -468,7 +468,8 @@ class FLAVORS2:
 
          # Error gain (or loss if minimizing and feature_error is higher)
          error_diff = feature_error - best_error # Assumes lower error is better
-         if self.minimize: error_diff = -error_diff # Adjust if minimizing
+         if self.minimize:
+             error_diff = -error_diff # Adjust if minimizing
 
          # Improvement part of ECI (higher is better)
          improvement_term = error_diff * tau / delta
@@ -929,8 +930,10 @@ class FLAVORS2:
         main_search_end = end_time - datetime.timedelta(seconds=refinement_duration)
 
         # Initialize performance/counts if not already done (e.g., in fit)
-        if not hasattr(self, 'feature_performance'): self.feature_performance = np.zeros(self.n_feats)
-        if not hasattr(self, 'feature_counts'): self.feature_counts = np.zeros(self.n_feats)
+        if not hasattr(self, 'feature_performance'):
+            self.feature_performance = np.zeros(self.n_feats)
+        if not hasattr(self, 'feature_counts'):
+            self.feature_counts = np.zeros(self.n_feats)
 
         # Initial subset size heuristic
         if not hasattr(self, 'num_features') or not self.fitted:
@@ -953,7 +956,8 @@ class FLAVORS2:
         with parallel_backend('loky'):
             while datetime.datetime.now() < main_search_end:
                 remaining_time = (main_search_end - datetime.datetime.now()).total_seconds()
-                if remaining_time <= 0: break # Exit if time is up
+                if remaining_time <= 0:
+                    break # Exit if time is up
                 remaining_budget_fraction = max(0.0, remaining_time / max(1e-9, (main_search_end - start_time).total_seconds()))
 
                 # Generate batch of candidates
@@ -1038,7 +1042,8 @@ class FLAVORS2:
         refine_start_time = datetime.datetime.now()
         with parallel_backend('loky'):
             while datetime.datetime.now() < end_time:
-                 if not self.leaderboard: break # Exit if no solution found
+                 if not self.leaderboard:
+                     break # Exit if no solution found
 
                  # Get the current best subset from leaderboard
                  # Sort leaderboard by error (lower is better)
@@ -1287,9 +1292,6 @@ class FLAVORS2:
         return X[:, best_subset_indices]
 
 
-from sklearn.base import BaseEstimator, TransformerMixin
-import numpy as np
-import pandas as pd
 
 class FLAVORS2FeatureSelector(BaseEstimator, TransformerMixin):
     def __init__(self, budget=30, minimize=False, metrics=None, c_sub=4, feature_priors=None, n_jobs=1,
