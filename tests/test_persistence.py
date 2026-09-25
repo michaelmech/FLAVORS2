@@ -176,6 +176,7 @@ def test_fit_copies_inputs_and_resume_rejects_mutated_retained_data():
     np.testing.assert_array_equal(selector.selector.X, original_X)
     np.testing.assert_array_equal(selector.selector.y, original_y)
     np.testing.assert_array_equal(selector.selector.sample_weight, original_weights)
+    selector.selector.X = selector.selector.X.copy()
     selector.selector.X[0, 0] += 1
     with pytest.raises(ValueError, match="training data"):
         selector.resume(budget=0.1)
