@@ -57,5 +57,5 @@ def test_strict_candidate_respects_phase_deadline():
     assert result["timed_out"]
     assert elapsed < 0.6
     assert selector.timed_out_evaluations_ == 1
-    assert selector._fresh_eval_capacity(phase_deadline) == 0
+    assert selector._strict_evaluation_deadline(phase_deadline) == phase_deadline
     assert selector._normalize_subset_key(candidate) not in selector._score_cache
