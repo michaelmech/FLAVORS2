@@ -22,7 +22,7 @@
 - **Hypothesis and confidence:** A separate public lifecycle module can extend the generated wrapper without editing its source; high confidence.
 - **Consequence if wrong:** Direct changes to the generated file could be lost on regeneration or violate repository instructions.
 - **Resolution:** Implemented the public subclass in `src/flavors2/selector.py` and exported it from the package root.
-  Existing search behavior remains inherited, and the full local test suite exercises the new public export.
+  The maintained `src/flavors2/search.py` subclass owns phase scheduling while inheriting evaluation and ECI primitives from the generated core.
 
 ## Review findings: refinement allocation and resume parameters
 
@@ -32,7 +32,6 @@
 - **Consequence if wrong:** Later fits silently receive the incremental budget, or a fixed search phase spends budget without consulting strategy ECI.
 - **Resolution:** Regression tests failed before the fixes and passed afterward.
   The maintained search subclass in src/flavors2/search.py routes all three phases through the adaptive portfolio and is used by both package-root public selectors.
-  The generated core remains unchanged.
   Resume passes its budget only to the retained searcher.
   Tests cover the final phase across three seeds and both public entry points, plus checkpoint, clone, and refit budget preservation.
 

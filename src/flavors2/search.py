@@ -34,12 +34,16 @@ class FLAVORS2(_GeneratedSearch):
             )
             trial_cost = (time.perf_counter() - started) / len(timed_out_keys)
             for key in timed_out_keys:
-                self._record_proposal_result(key, float("inf"), float("inf"), trial_cost)
+                self._record_proposal_result(
+                    key, float("inf"), float("inf"), trial_cost
+                )
         return results
 
     def _budget_limited_batch(self, candidates, deadline):
         admitted = super()._budget_limited_batch(candidates, deadline)
-        admitted_keys = {self._normalize_subset_key(candidate) for candidate in admitted}
+        admitted_keys = {
+            self._normalize_subset_key(candidate) for candidate in admitted
+        }
         for candidate in candidates:
             key = self._normalize_subset_key(candidate)
             if key not in admitted_keys:
@@ -72,7 +76,13 @@ class FLAVORS2(_GeneratedSearch):
         return float(error)
 
     def _search_phase(
-        self, current_subset, *, start_time, deadline, budget, refine=False,
+        self,
+        current_subset,
+        *,
+        start_time,
+        deadline,
+        budget,
+        refine=False,
         require_coverage=False,
     ):
         batch_size = self._worker_count()
@@ -87,7 +97,8 @@ class FLAVORS2(_GeneratedSearch):
             if require_coverage and not needs_coverage:
                 break
             self._set_coverage_pressure(
-                remaining, force=needs_coverage and (require_coverage or remaining > 0.2)
+                remaining,
+                force=needs_coverage and (require_coverage or remaining > 0.2),
             )
             if refine and self.leaderboard:
                 # Focus candidate mutations on the incumbent without restricting
@@ -130,7 +141,9 @@ class FLAVORS2(_GeneratedSearch):
                 restart_probability = min(0.1, no_improvement_counter / 50.0)
                 if self._rng.rand() < restart_probability:
                     score = self._format_global_score(self._current_best_global_score())
-                    print(f"Performing probabilistic restart... best_global_score={score}")
+                    print(
+                        f"Performing probabilistic restart... best_global_score={score}"
+                    )
                     sizes = [len(subset) for _, subset in self.leaderboard[:5]]
                     size = int(self._rng.choice(sizes)) if sizes else self.num_features
                     current_subset = self.search_strategy(size)
@@ -169,17 +182,25 @@ class FLAVORS2(_GeneratedSearch):
             self.best_error = self.current_error
             self.iters_best = 0
 
-        context = parallel_backend("loky") if self._worker_count() > 1 else nullcontext()
+        context = (
+            parallel_backend("loky") if self._worker_count() > 1 else nullcontext()
+        )
         with context:
             current_subset = self._search_phase(
                 current_subset, start_time=start_time, deadline=main_end, budget=budget
             )
             current_subset = self._search_phase(
-                current_subset, start_time=start_time, deadline=coverage_end,
-                budget=budget, require_coverage=True,
+                current_subset,
+                start_time=start_time,
+                deadline=coverage_end,
+                budget=budget,
+                require_coverage=True,
             )
             self._search_phase(
-                current_subset, start_time=start_time, deadline=end_time,
-                budget=budget, refine=True,
+                current_subset,
+                start_time=start_time,
+                deadline=end_time,
+                budget=budget,
+                refine=True,
             )
         self._ensure_search_fallback()
