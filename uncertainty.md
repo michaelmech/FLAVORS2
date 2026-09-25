@@ -35,3 +35,11 @@
   The generated core remains unchanged.
   Resume passes its budget only to the retained searcher.
   Tests cover the final phase across three seeds and both public entry points, plus checkpoint, clone, and refit budget preservation.
+
+## Search allocator chronology
+
+- **Uncertainty:** Should the post-selection size override or the inverse-ECI allocator determine actual proposal strategies?
+- **Evidence:** Commit d12983b6 introduced the override on July 13, while 4d49c717 introduced the fair-chance allocator on July 14; e7b56387 had omitted timeout cost on July 10.
+- **Hypothesis and confidence:** The newer ECI allocator is authoritative; high confidence from this chronology and the stated search contract.
+- **Consequence if wrong:** Local and uncertain proposals receive less than their fair share, while costly timeouts fail to influence ECI.
+- **Resolution:** The maintained search path keeps stochastic size exploration inside the global and ranked portfolio strategies and records real elapsed timeout cost without a successful score.

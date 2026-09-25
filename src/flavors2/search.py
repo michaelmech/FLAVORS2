@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 import datetime
+import time
 
 import numpy as np
 from joblib import parallel_backend
@@ -11,6 +12,21 @@ from .core import FLAVORS2 as _GeneratedSearch
 
 class FLAVORS2(_GeneratedSearch):
     """Allocate every search phase through the adaptive strategy portfolio."""
+
+    def _size_exploration_probability(self, remaining_budget_fraction):
+        return 0.0
+
+    def _evaluate_batch(self, subsets, deadline=None):
+        started = time.perf_counter()
+        results = super()._evaluate_batch(subsets, deadline=deadline)
+        timed_out_keys = {
+            result["subset_key"] for result in results if result.get("timed_out", False)
+        }
+        if timed_out_keys:
+            trial_cost = (time.perf_counter() - started) / len(timed_out_keys)
+            for key in timed_out_keys:
+                self._record_proposal_result(key, float("inf"), float("inf"), trial_cost)
+        return results
 
     def _strict_evaluation_deadline(self, deadline):
         if not self.strict_budget:

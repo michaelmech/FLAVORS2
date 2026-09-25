@@ -1,6 +1,8 @@
 """Regressions reported by the GitHub review of persistent searches."""
 
+from collections import Counter
 import datetime
+import time
 
 import numpy as np
 import pytest
@@ -8,6 +10,95 @@ from sklearn.base import clone
 
 from flavors2 import FLAVORS2, FLAVORS2FeatureSelector
 import flavors2.core as core_module
+
+
+def slow_review_metric(X, y, sample_weight=None):
+    if len(X) > 20:
+        time.sleep(2)
+    return {"score": 0.5}
+
+
+def test_realized_strategy_chances_follow_eci_allocator(monkeypatch):
+    optimizer = FLAVORS2(
+        budget=1, metrics=[slow_review_metric], random_state=7, strict_budget=False
+    )
+    optimizer.n_feats = 24
+    optimizer.unevaluated = set(range(24))
+    optimizer.iters = 10
+    optimizer.iters_best = 0
+    counter = {"value": 0}
+
+    def unique_candidate(*args):
+        counter["value"] += 1
+        return [index for index in range(24) if counter["value"] & (1 << index)]
+
+    monkeypatch.setattr(
+        optimizer,
+        "_strategy_eci",
+        lambda strategy: 1.0 if strategy == "global" else 1e9,
+    )
+    monkeypatch.setattr(optimizer, "_candidate_eci", lambda *args, **kwargs: 1.0)
+    monkeypatch.setattr(optimizer, "_propose_candidate", unique_candidate)
+
+    names, probabilities = optimizer._proposal_probabilities(0.1)
+    assert dict(zip(names, probabilities))["local"] >= 0.05
+    assert dict(zip(names, probabilities))["uncertain"] >= 0.05
+
+    counts = Counter()
+    for _ in range(6000):
+        candidate = optimizer._generate_candidate_batch([0, 1, 2], 1, 1, 0.1)[0]
+        key = optimizer._normalize_subset_key(candidate)
+        counts[optimizer._candidate_strategies.pop(key)] += 1
+        optimizer._candidate_eci_estimates.pop(key)
+
+    assert counts["local"] / 6000 >= 0.04
+    assert counts["uncertain"] / 6000 >= 0.04
+    assert len({optimizer._proposal_target("global", [0, 1, 2], 1) for _ in range(40)}) > 1
+
+
+def test_batched_strict_timeouts_charge_eci_once_without_a_score():
+    rng = np.random.RandomState(3)
+    X = rng.randn(40, 10)
+    y = (X[:, 0] > 0).astype(int)
+    optimizer = FLAVORS2(
+        budget=0.01,
+        metrics=[slow_review_metric],
+        n_jobs=2,
+        random_state=3,
+        strict_budget=True,
+    ).fit(X, y)
+    candidates = [list(range(10)), list(range(9))]
+    for candidate, strategy in zip(candidates, ("local", "uncertain")):
+        key = optimizer._normalize_subset_key(candidate)
+        optimizer._candidate_strategies[key] = strategy
+        optimizer._candidate_eci_estimates[key] = 0.8
+
+    initial_eci = {name: optimizer._strategy_eci(name) for name in ("local", "uncertain")}
+    now = datetime.datetime.now()
+    optimizer._fit_deadline = now + datetime.timedelta(seconds=1)
+    optimizer._worker_cleanup_reserve = 0.05
+    phase_deadline = now + datetime.timedelta(seconds=0.2)
+
+    started = time.perf_counter()
+    results = optimizer._evaluate_batch(
+        [candidates[0], candidates[1], candidates[0]], deadline=phase_deadline
+    )
+    elapsed = time.perf_counter() - started
+
+    assert all(result["timed_out"] for result in results)
+    assert elapsed < 0.6
+    assert len(optimizer.eci_history_) == 2
+    charged = 0.0
+    for name in ("local", "uncertain"):
+        stats = optimizer._proposal_stats[name]
+        assert stats["trials"] == 1
+        assert optimizer._strategy_eci(name) > initial_eci[name]
+        charged += stats["cost"]
+    assert 0 < charged <= elapsed
+    assert all(entry["error"] == float("inf") for entry in optimizer.eci_history_)
+    assert not optimizer.performance_history
+    assert not optimizer._score_cache
+    assert optimizer.current_error == float("inf")
 
 
 @pytest.mark.parametrize("estimator_type", [FLAVORS2, FLAVORS2FeatureSelector])
