@@ -8,11 +8,14 @@
 
 ## Install
 
-FLAVORS2 can be installed from [PyPI](https://pypi.org/project/flavors-squared):
+The save, load, and resume workflow below is available in this repository version.
+Install from a checkout until that version is published to PyPI:
 
 ```bash
-pip install flavors-squared
+python -m pip install .
 ```
+
+The [PyPI package](https://pypi.org/project/flavors-squared) can be installed with `pip install flavors-squared`; check its release version before relying on the persistence API.
 
 
 ## Feature Selection Example (scikit-learn compatible)

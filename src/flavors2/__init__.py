@@ -15,7 +15,7 @@ from .core import FLAVORS2
 from .selector import FLAVORS2FeatureSelector
 from .legacy import FLAVORS2 as FLAVORS2Legacy
 from .legacy import FLAVORS2FeatureSelector as FLAVORS2LegacyFeatureSelector
-from .__version__ import __version__  
+from .__version__ import __version__
 
 __all__ = [
     "FLAVORS2",
