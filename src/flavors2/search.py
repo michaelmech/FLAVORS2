@@ -12,6 +12,16 @@ from .core import FLAVORS2 as _GeneratedSearch
 class FLAVORS2(_GeneratedSearch):
     """Allocate every search phase through the adaptive strategy portfolio."""
 
+    def _strict_evaluation_deadline(self, deadline):
+        if not self.strict_budget:
+            return deadline
+        fit_deadline = getattr(self, "_fit_deadline", deadline)
+        cleanup_reserve = getattr(self, "_worker_cleanup_reserve", 0.05)
+        return min(
+            deadline,
+            fit_deadline - datetime.timedelta(seconds=cleanup_reserve),
+        )
+
     def _ensure_search_fallback(self):
         # A warm start must retain its finite incumbent if no new trial fits.
         if not self.leaderboard:

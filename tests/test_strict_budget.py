@@ -1,8 +1,9 @@
 import time
+import datetime
 
 import numpy as np
 
-from flavors2 import FLAVORS2FeatureSelector
+from flavors2 import FLAVORS2, FLAVORS2FeatureSelector
 
 
 def slow_metric(X, y, sample_weight=None):
@@ -32,3 +33,29 @@ def test_strict_budget_terminates_a_running_candidate():
     assert selector.selector.cache_misses_ == 1
     assert not selector.selector._score_cache
     assert selector.selected_indices_
+
+
+def test_strict_candidate_respects_phase_deadline():
+    rng = np.random.RandomState(3)
+    X = rng.randn(40, 10)
+    y = (X[:, 0] > 0).astype(int)
+    selector = FLAVORS2(
+        budget=0.01, metrics=[slow_metric], random_state=3, strict_budget=True
+    ).fit(X, y)
+    candidate = list(range(X.shape[1]))
+    assert selector._normalize_subset_key(candidate) not in selector._score_cache
+
+    now = datetime.datetime.now()
+    selector._fit_deadline = now + datetime.timedelta(seconds=1)
+    selector._worker_cleanup_reserve = 0.05
+    phase_deadline = now + datetime.timedelta(seconds=0.15)
+
+    started = time.monotonic()
+    result = selector._evaluate_batch([candidate], deadline=phase_deadline)[0]
+    elapsed = time.monotonic() - started
+
+    assert result["timed_out"]
+    assert elapsed < 0.6
+    assert selector.timed_out_evaluations_ == 1
+    assert selector._fresh_eval_capacity(phase_deadline) == 0
+    assert selector._normalize_subset_key(candidate) not in selector._score_cache
