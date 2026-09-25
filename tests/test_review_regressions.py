@@ -18,6 +18,111 @@ def slow_review_metric(X, y, sample_weight=None):
     return {"score": 0.5}
 
 
+def phase_sensitive_metric(X, y, sample_weight=None):
+    if len(X) > 20 and X.shape[1] == 10:
+        time.sleep(2)
+    return {"score": 0.5}
+
+
+def test_phase_timeout_allows_later_evaluation_without_fit_exhaustion():
+    rng = np.random.RandomState(4)
+    X = rng.randn(40, 10)
+    y = (X[:, 0] > 0).astype(int)
+    optimizer = FLAVORS2(
+        budget=0.01, metrics=[phase_sensitive_metric], strict_budget=True
+    ).fit(X, y)
+    optimizer.budget_exhausted_ = False
+    slow = list(range(10))
+    fast = list(range(9))
+    slow_key = optimizer._normalize_subset_key(slow)
+    fast_key = optimizer._normalize_subset_key(fast)
+    optimizer._candidate_strategies[slow_key] = "local"
+    optimizer._candidate_eci_estimates[slow_key] = 0.8
+    optimizer._candidate_strategies[fast_key] = "global"
+    optimizer._candidate_eci_estimates[fast_key] = 0.8
+    now = datetime.datetime.now()
+    optimizer._fit_deadline = now + datetime.timedelta(seconds=5)
+    optimizer._worker_cleanup_reserve = 0.05
+
+    try:
+        first = optimizer._evaluate_batch(
+            [slow], deadline=now + datetime.timedelta(seconds=0.2)
+        )[0]
+        assert first["timed_out"]
+        assert not optimizer.budget_exhausted_
+        assert optimizer.timed_out_evaluations_ == 1
+        assert optimizer.eci_history_[-1]["strategy"] == "local"
+
+        second = optimizer._evaluate_batch(
+            [fast], deadline=datetime.datetime.now() + datetime.timedelta(seconds=3)
+        )[0]
+        assert not second.get("timed_out", False)
+        optimizer._update_after_evaluation(second, fast, slow)
+        assert not optimizer.budget_exhausted_
+        assert np.isfinite(optimizer.current_error)
+        assert len(optimizer.performance_history) == 1
+        assert optimizer.eci_history_[-1]["strategy"] == "global"
+
+        incumbent_error = optimizer.current_error
+        optimizer._candidate_strategies[slow_key] = "local"
+        optimizer._candidate_eci_estimates[slow_key] = 0.8
+        overall_deadline = datetime.datetime.now() + datetime.timedelta(seconds=0.25)
+        optimizer._fit_deadline = overall_deadline
+        third = optimizer._evaluate_batch(
+            [slow], deadline=overall_deadline + datetime.timedelta(seconds=1)
+        )[0]
+        assert third["timed_out"]
+        assert optimizer.budget_exhausted_
+        assert optimizer.timed_out_evaluations_ == 2
+        assert optimizer.current_error == incumbent_error
+        assert len(optimizer.performance_history) == 1
+    finally:
+        optimizer._shutdown_evaluation_executor(kill_workers=True)
+
+
+def test_budget_filter_removes_only_rejected_candidate_metadata(monkeypatch):
+    rng = np.random.RandomState(5)
+    X = rng.randn(40, 10)
+    y = (X[:, 0] > 0).astype(int)
+    optimizer = FLAVORS2(
+        budget=0.01,
+        metrics=[phase_sensitive_metric],
+        n_jobs=4,
+        strict_budget=False,
+    ).fit(X, y)
+    optimizer.cost_history = [1.0]
+    proposals = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    strategies = ("local", "global", "ranked", "uncertain")
+    for candidate, strategy in zip(proposals, strategies):
+        key = optimizer._normalize_subset_key(candidate)
+        optimizer._candidate_strategies[key] = strategy
+        optimizer._candidate_eci_estimates[key] = 0.8
+
+    now = datetime.datetime(2026, 1, 1)
+
+    class FixedClock(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(core_module.datetime, "datetime", FixedClock)
+    admitted = optimizer._budget_limited_batch(
+        proposals, now + datetime.timedelta(seconds=1.5)
+    )
+
+    assert admitted == [proposals[0]]
+    admitted_key = optimizer._normalize_subset_key(admitted[0])
+    assert optimizer._candidate_strategies == {admitted_key: "local"}
+    assert optimizer._candidate_eci_estimates == {admitted_key: 0.8}
+
+    result = optimizer._evaluate_batch(admitted, deadline=now + datetime.timedelta(seconds=1.5))[0]
+    optimizer._update_after_evaluation(result, admitted[0], [])
+    assert optimizer._proposal_stats["local"]["trials"] == 1
+    assert optimizer.eci_history_[-1]["strategy"] == "local"
+    assert not optimizer._candidate_strategies
+    assert not optimizer._candidate_eci_estimates
+
+
 def test_realized_strategy_chances_follow_eci_allocator(monkeypatch):
     optimizer = FLAVORS2(
         budget=1, metrics=[slow_review_metric], random_state=7, strict_budget=False

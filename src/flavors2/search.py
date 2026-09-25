@@ -17,16 +17,35 @@ class FLAVORS2(_GeneratedSearch):
         return 0.0
 
     def _evaluate_batch(self, subsets, deadline=None):
+        was_exhausted = self.budget_exhausted_
         started = time.perf_counter()
         results = super()._evaluate_batch(subsets, deadline=deadline)
         timed_out_keys = {
             result["subset_key"] for result in results if result.get("timed_out", False)
         }
         if timed_out_keys:
+            fit_deadline = getattr(self, "_fit_deadline", deadline)
+            cleanup_reserve = getattr(self, "_worker_cleanup_reserve", 0.05)
+            fit_cutoff = fit_deadline - datetime.timedelta(seconds=cleanup_reserve)
+            self.budget_exhausted_ = (
+                was_exhausted
+                or deadline >= fit_cutoff
+                or datetime.datetime.now() >= fit_cutoff
+            )
             trial_cost = (time.perf_counter() - started) / len(timed_out_keys)
             for key in timed_out_keys:
                 self._record_proposal_result(key, float("inf"), float("inf"), trial_cost)
         return results
+
+    def _budget_limited_batch(self, candidates, deadline):
+        admitted = super()._budget_limited_batch(candidates, deadline)
+        admitted_keys = {self._normalize_subset_key(candidate) for candidate in admitted}
+        for candidate in candidates:
+            key = self._normalize_subset_key(candidate)
+            if key not in admitted_keys:
+                self._candidate_strategies.pop(key, None)
+                self._candidate_eci_estimates.pop(key, None)
+        return admitted
 
     def _strict_evaluation_deadline(self, deadline):
         if not self.strict_budget:
@@ -120,7 +139,7 @@ class FLAVORS2(_GeneratedSearch):
         key = self._normalize_subset_key(current_subset)
         self._candidate_strategies[key] = "global"
         self._candidate_eci_estimates[key] = self._candidate_eci(key)
-        if self._fresh_eval_capacity(end_time) <= 0:
+        if not self._budget_limited_batch([current_subset], end_time):
             self._ensure_search_fallback()
             return
         result = self._evaluate_batch([current_subset], deadline=end_time)[0]
