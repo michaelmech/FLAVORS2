@@ -23,3 +23,15 @@
 - **Consequence if wrong:** Direct changes to the generated file could be lost on regeneration or violate repository instructions.
 - **Resolution:** Implemented the public subclass in `src/flavors2/selector.py` and exported it from the package root.
   Existing search behavior remains inherited, and the full local test suite exercises the new public export.
+
+## Review findings: refinement allocation and resume parameters
+
+- **Uncertainty:** Do the public lifecycle and final search phase preserve the documented constructor budget and fair-chance strategy allocation?
+- **Evidence:** PR #2 comments 4101646148 and 4101646156 identified a local-only refinement pool and assignment to the wrapper budget inside resume.
+- **Hypothesis and confidence:** Both violate the public contract despite the initial suite passing; high confidence after reproducing them through public fits.
+- **Consequence if wrong:** Later fits silently receive the incremental budget, or a fixed search phase spends budget without consulting strategy ECI.
+- **Resolution:** Regression tests failed before the fixes and passed afterward.
+  The maintained search subclass in src/flavors2/search.py routes all three phases through the adaptive portfolio and is used by both package-root public selectors.
+  The generated core remains unchanged.
+  Resume passes its budget only to the retained searcher.
+  Tests cover the final phase across three seeds and both public entry points, plus checkpoint, clone, and refit budget preservation.

@@ -19,6 +19,7 @@ from sklearn.exceptions import NotFittedError
 
 from .__version__ import __version__
 from .core import FLAVORS2FeatureSelector as _BaseSelector
+from .search import FLAVORS2
 
 
 def _checkpoint_header():
@@ -119,7 +120,13 @@ class FLAVORS2FeatureSelector(_BaseSelector):
             weights = (
                 None if sample_weight is None else np.array(sample_weight, copy=True)
             )
-            super().fit(X, y, sample_weight=weights)
+            self.n_features_in_ = X.shape[1]
+            if isinstance(X, pd.DataFrame):
+                self.feature_names_in_ = X.columns.astype(str).to_numpy()
+            self._sample_weight = weights
+            self.selector = FLAVORS2(**self.get_params(deep=False))
+            self.selector.fit(X, y, sample_weight=weights)
+            self._sync_search_results()
             self._training_fingerprint_ = self._training_fingerprint()
         finally:
             self._operation_in_progress = False
@@ -140,7 +147,6 @@ class FLAVORS2FeatureSelector(_BaseSelector):
         self._operation_in_progress = True
         previous_best = self.selector.best_error
         try:
-            self.budget = budget
             self.selector.fit(
                 self.selector.X,
                 self.selector.y,
@@ -148,8 +154,8 @@ class FLAVORS2FeatureSelector(_BaseSelector):
                 budget=budget,
             )
         finally:
-            # The generated core's initial timeout path resets best_error even
-            # when a previous search already found a finite incumbent.
+            # Retain the previous incumbent when a resumed phase cannot finish
+            # a new evaluation.
             self.selector.best_error = min(previous_best, self.selector.best_error)
             self._sync_search_results()
             self._operation_in_progress = False

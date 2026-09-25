@@ -77,6 +77,7 @@ Worker processes are recreated when needed.
 
 `resume(budget=...)` uses the saved training inputs and fitted search configuration, and refreshes the public selection and ECI attributes when it finishes.
 Constructor parameter changes take effect on the next `fit()`, which starts a fresh search.
+The additional `resume(budget=...)` duration does not change the configured budget for a future `fit()` or clone.
 Resume takes no replacement dataset or metric, so cached scores cannot accidentally be reused for different inputs through this API.
 New data passed to `transform()` must have the original number and order of features.
 When both training and transformed inputs are DataFrames, their column names and order must match.
@@ -222,6 +223,7 @@ Estimated Cost for Improvement (ECI) is the organizing principle for that alloca
 Each proposal strategy tracks cumulative evaluation cost, the costs at its latest improvements, and the error reduction between those improvements.
 Strategies with lower estimated cost to produce the next improvement receive more trials through inverse-ECI sampling.
 Every strategy retains a fixed fair-chance probability because ECI estimates are uncertain and global exploration must remain reachable.
+The same adaptive portfolio drives the main search, coverage catch-up, and final refinement.
 
 Before evaluation, each proposed subset also receives a candidate ECI based on predicted evaluation cost, learned feature evidence, uncertainty, subset-size evidence, and novelty.
 Candidate selection uses inverse-ECI sampling instead of a deterministic ranking.
@@ -278,6 +280,7 @@ See `assets/h2h_benchmark_summary.csv` for details.
 ## Documentation
 
 - [Public Selector and Persistence](src/flavors2/selector.py)
+- [Adaptive Search Scheduling](src/flavors2/search.py)
 - [Core Implementation](https://github.com/michaelmech/FLAVORS2/blob/main/src/flavors2/core.py)
 
 ## Citations

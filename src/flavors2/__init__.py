@@ -11,7 +11,7 @@ Examples
 >>> fs.fit(X, y)
 """
 
-from .core import FLAVORS2
+from .search import FLAVORS2
 from .selector import FLAVORS2FeatureSelector
 from .legacy import FLAVORS2 as FLAVORS2Legacy
 from .legacy import FLAVORS2FeatureSelector as FLAVORS2LegacyFeatureSelector
