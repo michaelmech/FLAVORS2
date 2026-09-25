@@ -62,12 +62,22 @@ class FLAVORS2(_GeneratedSearch):
         if not self.leaderboard:
             self.leaderboard.append((float("inf"), self._fallback_subset_from_priors()))
 
+    def _reference_error(self, subset):
+        cached = self._score_cache.get(self._normalize_subset_key(subset))
+        if cached is None:
+            return None
+        error = cached.get("current_error")
+        if error is None or not np.isfinite(error):
+            return None
+        return float(error)
+
     def _search_phase(
         self, current_subset, *, start_time, deadline, budget, refine=False,
         require_coverage=False,
     ):
         batch_size = self._worker_count()
         no_improvement_counter = 0
+        reference_error = self._reference_error(current_subset)
         duration = max(1e-9, (deadline - start_time).total_seconds())
         while datetime.datetime.now() < deadline:
             remaining = max(
@@ -83,6 +93,7 @@ class FLAVORS2(_GeneratedSearch):
                 # Focus candidate mutations on the incumbent without restricting
                 # the strategy portfolio that can spend the remaining budget.
                 current_subset = list(self.leaderboard[0][1])
+                reference_error = self._reference_error(current_subset)
             step_size = self.adjust_step_size(len(current_subset), remaining)
             if refine:
                 step_size = 1
@@ -93,17 +104,23 @@ class FLAVORS2(_GeneratedSearch):
             if not candidates:
                 break
 
-            previous_error = self.current_error
-            best_error = previous_error
+            best_error = float("inf") if reference_error is None else reference_error
             best_subset = None
             results = self._evaluate_batch(candidates, deadline=deadline)
             for subset, result in zip(candidates, results):
                 self._update_after_evaluation(result, subset, current_subset)
-                if not result.get("timed_out", False) and self.current_error < best_error:
-                    best_error = self.current_error
+                candidate_error = result.get("current_error")
+                if (
+                    not result.get("timed_out", False)
+                    and candidate_error is not None
+                    and np.isfinite(candidate_error)
+                    and candidate_error < best_error
+                ):
+                    best_error = candidate_error
                     best_subset = subset
             if best_subset is not None:
                 current_subset = list(best_subset)
+                reference_error = float(best_error)
                 self.num_features = len(current_subset)
                 no_improvement_counter = 0
             else:
@@ -117,6 +134,7 @@ class FLAVORS2(_GeneratedSearch):
                     sizes = [len(subset) for _, subset in self.leaderboard[:5]]
                     size = int(self._rng.choice(sizes)) if sizes else self.num_features
                     current_subset = self.search_strategy(size)
+                    reference_error = self._reference_error(current_subset)
                     self.num_features = len(current_subset)
                     no_improvement_counter = 0
                     # The new reference is explored by the next portfolio batch.

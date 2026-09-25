@@ -10,6 +10,7 @@ from sklearn.base import clone
 
 from flavors2 import FLAVORS2, FLAVORS2FeatureSelector
 import flavors2.core as core_module
+import flavors2.search as search_module
 
 
 def slow_review_metric(X, y, sample_weight=None):
@@ -22,6 +23,119 @@ def phase_sensitive_metric(X, y, sample_weight=None):
     if len(X) > 20 and X.shape[1] == 10:
         time.sleep(2)
     return {"score": 0.5}
+
+
+def scheduled_search(monkeypatch, errors):
+    optimizer = FLAVORS2(
+        budget=1, metrics=[phase_sensitive_metric], n_jobs=2, strict_budget=False
+    )
+    optimizer.n_feats = 10
+    optimizer.unevaluated = set(range(10))
+    optimizer.num_features = 1
+    optimizer.current_error = 0.1
+    optimizer.best_error = 0.1
+    optimizer.iters = 0
+    optimizer.iters_best = 0
+    optimizer._score_cache[(0,)] = {"current_error": 0.1}
+    epoch = datetime.datetime(2026, 1, 1)
+    clock = {"tick": 0}
+    batches = []
+    references = []
+
+    class SearchClock(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return epoch + datetime.timedelta(seconds=clock["tick"])
+
+    def generate(reference, *args):
+        references.append(tuple(reference))
+        return batches.pop(0)
+
+    def evaluate(subsets, deadline=None):
+        results = []
+        for subset in subsets:
+            key = optimizer._normalize_subset_key(subset)
+            result = {"current_error": errors[key], "subset_key": key}
+            optimizer._score_cache[key] = result
+            results.append(result)
+        clock["tick"] += 1
+        return results
+
+    monkeypatch.setattr(search_module.datetime, "datetime", SearchClock)
+    monkeypatch.setattr(optimizer, "_generate_candidate_batch", generate)
+    monkeypatch.setattr(optimizer, "_budget_limited_batch", lambda candidates, deadline: candidates)
+    monkeypatch.setattr(optimizer, "_evaluate_batch", evaluate)
+    monkeypatch.setattr(
+        optimizer,
+        "_update_after_evaluation",
+        lambda result, subset, previous: setattr(
+            optimizer, "current_error", result["current_error"]
+        ),
+    )
+    return optimizer, epoch, batches, references
+
+
+def test_search_reference_uses_its_own_error_across_phases_and_refinement(monkeypatch):
+    optimizer, epoch, batches, references = scheduled_search(
+        monkeypatch,
+        {(1,): 0.5, (2,): 0.4, (3,): 0.3, (4,): 0.2, (6,): 0.07},
+    )
+    batches.extend([[[1], [2]], [[3]]])
+
+    reference = optimizer._search_phase(
+        [0], start_time=epoch, deadline=epoch + datetime.timedelta(seconds=2), budget=2
+    )
+    assert reference == [0]
+    assert references == [(0,), (0,)]
+    assert optimizer.current_error == 0.3
+
+    batches.append([[4]])
+    reference = optimizer._search_phase(
+        reference,
+        start_time=epoch + datetime.timedelta(seconds=2),
+        deadline=epoch + datetime.timedelta(seconds=3),
+        budget=2,
+    )
+    assert reference == [0]
+
+    optimizer.leaderboard = [(0.05, [5])]
+    optimizer._score_cache[(5,)] = {"current_error": 0.05}
+    batches.append([[6]])
+    reference = optimizer._search_phase(
+        reference,
+        start_time=epoch + datetime.timedelta(seconds=3),
+        deadline=epoch + datetime.timedelta(seconds=4),
+        budget=2,
+        refine=True,
+    )
+    assert reference == [5]
+    assert references == [(0,), (0,), (0,), (5,)]
+
+
+def test_restart_keeps_an_unevaluated_reference_explicit(monkeypatch):
+    optimizer, epoch, batches, references = scheduled_search(
+        monkeypatch, {(1,): 0.5, (8,): 0.6}
+    )
+    optimizer.iters = 21
+    optimizer.leaderboard = [(0.1, [0])]
+    batches.extend([[[1]], [[8]]])
+
+    class RestartRng:
+        def rand(self):
+            return 0.0
+
+        def choice(self, values):
+            return values[0]
+
+    optimizer._rng = RestartRng()
+    monkeypatch.setattr(optimizer, "search_strategy", lambda size: [7])
+
+    reference = optimizer._search_phase(
+        [0], start_time=epoch, deadline=epoch + datetime.timedelta(seconds=2), budget=2
+    )
+    assert references == [(0,), (7,)]
+    assert reference == [8]
+    assert optimizer._score_cache[(8,)]["current_error"] == 0.6
 
 
 def test_phase_timeout_allows_later_evaluation_without_fit_exhaustion():
@@ -41,7 +155,7 @@ def test_phase_timeout_allows_later_evaluation_without_fit_exhaustion():
     optimizer._candidate_strategies[fast_key] = "global"
     optimizer._candidate_eci_estimates[fast_key] = 0.8
     now = datetime.datetime.now()
-    optimizer._fit_deadline = now + datetime.timedelta(seconds=5)
+    optimizer._fit_deadline = now + datetime.timedelta(seconds=15)
     optimizer._worker_cleanup_reserve = 0.05
 
     try:
@@ -54,7 +168,7 @@ def test_phase_timeout_allows_later_evaluation_without_fit_exhaustion():
         assert optimizer.eci_history_[-1]["strategy"] == "local"
 
         second = optimizer._evaluate_batch(
-            [fast], deadline=datetime.datetime.now() + datetime.timedelta(seconds=3)
+            [fast], deadline=datetime.datetime.now() + datetime.timedelta(seconds=10)
         )[0]
         assert not second.get("timed_out", False)
         optimizer._update_after_evaluation(second, fast, slow)
